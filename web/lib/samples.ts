@@ -1,4 +1,4 @@
-import type { Device, HardwareSpec, Language, WorkloadEstimate } from './roofline';
+import type { Device, HardwareSpec, Language, WorkloadEstimate, WorkloadMode } from './roofline';
 
 /**
  * Starter samples. FLOP/byte figures are hand-derived ESTIMATES for the
@@ -11,6 +11,7 @@ export interface Sample {
   language: Language;
   device: Device;
   code: string;
+  workload_mode: WorkloadMode;
   workload: WorkloadEstimate;
   note: string;
 }
@@ -28,10 +29,15 @@ def setup():
 
 
 def benchmark():
-    """Timed region. Returns nothing; the agent times this call."""
+    """Timed region.
+
+    KernelForge protocol: return a mapping with an "output" key plus the
+    FLOP and byte counts this kernel actually moves. Pure-Python floats are
+    IEEE double, so one add per element moves 3 arrays * 8 bytes.
+    """
     for index in range(size):
         out[index] = a[index] + b[index]
-    return math.fsum(out[:16])
+    return {"output": out[:16], "flops": size, "bytes": 3 * size * 8}
 `;
 
 const MATMUL_TORCH = `import torch
@@ -46,9 +52,13 @@ def setup():
 
 
 def benchmark():
-    """Timed region. The agent synchronises CUDA before and after."""
+    """Timed region. The agent synchronises CUDA around this call.
+
+    2 * n^3 FLOPs and 3 fp32 n^2 tiles (2 reads + 1 write) are moved.
+    """
     out = a @ b
-    return float(out[0, 0])
+    n = a.shape[0]
+    return {"output": float(out[0, 0]), "flops": 2 * n * n * n, "bytes": 3 * n * n * 4}
 `;
 
 const ADD_TRITON = `import torch
@@ -75,9 +85,10 @@ def setup():
 
 
 def benchmark():
+    """Timed region. One fp32 add per element moves 3 arrays * 4 bytes."""
     grid = (triton.cdiv(n, 1024),)
     add_kernel[grid](x, y, out, n, BLOCK=1024)
-    return None
+    return {"output": float(out[0]), "flops": n, "bytes": 3 * n * 4}
 `;
 
 export const SAMPLES: Sample[] = [
@@ -86,15 +97,17 @@ export const SAMPLES: Sample[] = [
     label: 'Vector add (pure Python)',
     language: 'python',
     device: 'cpu',
+    workload_mode: 'protocol',
     code: VECTOR_ADD_CPU,
-    workload: { flops: 1_048_576, bytes_transferred: 12_582_912 },
-    note: 'N=2^20 fp64 adds: 1 FLOP/element, 3 arrays x 8 bytes -> AI 0.083 FLOP/byte (memory bound).',
+    workload: { flops: 1_048_576, bytes_transferred: 25_165_824 },
+    note: 'N=2^20 fp64 adds: 1 FLOP/element, 3 arrays x 8 bytes -> AI 0.042 FLOP/byte (memory bound).',
   },
   {
     id: 'matmul-pytorch',
     label: 'Matmul 1024^3 (PyTorch)',
     language: 'pytorch',
     device: 'cuda',
+    workload_mode: 'protocol',
     code: MATMUL_TORCH,
     workload: { flops: 2_147_483_648, bytes_transferred: 12_582_912 },
     note: '2*1024^3 FLOPs (2.1 GFLOP), 3 fp32 1024^2 tiles -> AI ~171 FLOP/byte (compute bound).',
@@ -104,6 +117,7 @@ export const SAMPLES: Sample[] = [
     label: 'Vector add (Triton)',
     language: 'triton',
     device: 'cuda',
+    workload_mode: 'protocol',
     code: ADD_TRITON,
     workload: { flops: 4_194_304, bytes_transferred: 50_331_648 },
     note: 'N=2^22 fp32 adds with a @triton.jit kernel -> AI 0.083 FLOP/byte (memory bound).',
@@ -118,16 +132,23 @@ export interface HardwarePreset {
 }
 
 /**
- * NOMINAL datasheet-class values, NOT detected hardware. On a real deployment
- * the runner probes the device; here the user picks a class and may edit the
- * numbers to match their own silicon.
+ * NOMINAL datasheet-class values, NOT detected hardware. T4 comes first
+ * because it matches the free Google Colab GPU, so results can be compared
+ * against a well-known card. On a real deployment the runner probes the
+ * device; here the user picks a class and may edit the numbers.
  */
 export const HARDWARE_PRESETS: HardwarePreset[] = [
   {
+    id: 't4',
+    label: 'NVIDIA T4 (Colab class)',
+    spec: { name: 'NVIDIA T4 (nominal)', peak_compute_tflops: 8.1, peak_bandwidth_gbps: 320 },
+    note: 'Free-tier Colab GPU: 16 GB GDDR6, ~8.1 TFLOP/s fp32 and ~320 GB/s nominal. Edit to match your device.',
+  },
+  {
     id: 'datacenter-gpu',
-    label: 'Datacenter GPU class',
-    spec: { name: 'Datacenter GPU class (nominal)', peak_compute_tflops: 19.5, peak_bandwidth_gbps: 1555 },
-    note: 'Nominal fp32 peaks of an A100-class accelerator. Edit to match your device.',
+    label: 'A100 class',
+    spec: { name: 'A100 class (nominal)', peak_compute_tflops: 19.5, peak_bandwidth_gbps: 1555 },
+    note: 'Nominal fp32 peaks of an A100 40GB accelerator. Edit to match your device.',
   },
   {
     id: 'consumer-gpu',

@@ -30,7 +30,11 @@ interface MemoryPipelineProps {
   device: Device;
   bytesTransferred: number;
   latencyMs: number | null;
+  bottleneck: 'memory' | 'compute' | null;
 }
+
+const MEMORY_STAGES: Stage[] = ['host_ram', 'pcie', 'vram'];
+const COMPUTE_STAGES: Stage[] = ['sram', 'cores'];
 
 function formatBytes(bytes: number): string {
   const units: Array<[number, string]> = [[1e9, 'GB'], [1e6, 'MB'], [1e3, 'kB']];
@@ -46,7 +50,11 @@ export default function MemoryPipeline({
   device,
   bytesTransferred,
   latencyMs,
+  bottleneck,
 }: MemoryPipelineProps) {
+  const bindingRoof = bottleneck === null
+    ? null
+    : bottleneck === 'memory' ? MEMORY_STAGES : COMPUTE_STAGES;
   return (
     <section className="flex h-full flex-col gap-2">
       <svg viewBox="0 0 900 250" role="img" aria-label="Illustrated data movement path" className="w-full">
@@ -56,7 +64,8 @@ export default function MemoryPipeline({
           const value = progress[node.stage] ?? 0;
           const active = running && value > 0 && value < 1 && !inapplicable;
           const complete = value >= 1 && !inapplicable;
-          const stroke = active ? '#f59e0b' : complete ? '#10b981' : '#1e293b';
+          const onBindingRoof = bindingRoof !== null && bindingRoof.includes(node.stage);
+          const stroke = onBindingRoof ? '#38bdf8' : active ? '#f59e0b' : complete ? '#10b981' : '#1e293b';
           const barWidth = Math.max(0, Math.min(1, inapplicable ? 0 : value)) * (BOX_WIDTH - 28);
           return (
             <g key={node.stage} opacity={inapplicable ? 0.45 : 1}>
@@ -124,7 +133,12 @@ export default function MemoryPipeline({
         })}
 
         <text x={BOX_X0} y={30} fontSize={12} fill="#94a3b8">
-          {'Illustrated path: synthetically advanced - no memory counters were read'}
+          {bottleneck === null
+            ? 'Illustrated path: synthetically advanced - no memory counters were read'
+            : `${bottleneck === 'memory' ? 'Memory' : 'Compute'} roof binds - highlighted stages form the binding path`}
+        </text>
+        <text x={BOX_X0} y={46} fontSize={11} fill="#64748b">
+          {'Bottleneck derived from the roofline position (AI vs ridge point), not from a counter'}
         </text>
         <text x={BOX_X0} y={214} fontSize={11} fill="#64748b">
           {`device=${device}  |  declared traffic=${formatBytes(bytesTransferred)}  |  ${

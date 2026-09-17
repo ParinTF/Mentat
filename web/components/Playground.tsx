@@ -2,7 +2,8 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
-import { Activity, AlertTriangle, Cpu, Gauge, Play, Square, Terminal, Zap } from 'lucide-react';
+import { Activity, AlertTriangle, Cpu, Gauge, History, Play, Square, Terminal, Zap } from 'lucide-react';
+import ChallengePanel from './ChallengePanel';
 import CodeEditor from './CodeEditor';
 import MemoryPipeline from './MemoryPipeline';
 import RooflineChart from './RooflineChart';
@@ -61,6 +62,88 @@ export default function Playground() {
   const consoleRef = useRef<HTMLDivElement | null>(null);
   const busy = status === 'queued' || status === 'compiling' || status === 'running';
 
+  interface Capabilities {
+    mode: string;
+    devices: { cpu: boolean; cuda: boolean };
+    languages: Record<string, boolean>;
+  }
+
+  interface HistoryEntry {
+    savedAt: string;
+    language: Language;
+    device: Device;
+    hardwareName: string;
+    latency_ms: number;
+    arithmetic_intensity: number | null;
+    bottleneck: 'memory' | 'compute' | null;
+    code: string;
+  }
+
+  const HISTORY_KEY = 'kernelforge.history.v1';
+  const [capabilities, setCapabilities] = useState<Capabilities | null>(null);
+  const [history, setHistory] = useState<HistoryEntry[]>([]);
+  const [shareNotice, setShareNotice] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    const base = process.env.NEXT_PUBLIC_KF_API ?? '';
+    if (base === '') return;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 4000);
+    fetch(`${base}/api/v1/capabilities`, { signal: controller.signal })
+      .then(response => (response.ok ? response.json() : Promise.reject(new Error(`HTTP ${response.status}`))))
+      .then(data => { if (!cancelled) setCapabilities(data as Capabilities); })
+      .catch(() => { /* no backend reachable: stay in local simulation */ })
+      .finally(() => clearTimeout(timer));
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+      controller.abort();
+    };
+  }, []);
+
+  useEffect(() => {
+    const raw = window.localStorage.getItem(HISTORY_KEY);
+    if (raw === null) return;
+    try {
+      const parsed: unknown = JSON.parse(raw);
+      if (Array.isArray(parsed)) setHistory(parsed as HistoryEntry[]);
+    } catch {
+      window.localStorage.removeItem(HISTORY_KEY);
+    }
+  }, []);
+
+  const appendHistory = useCallback((entry: HistoryEntry) => {
+    setHistory(previous => {
+      const next = [entry, ...previous].slice(0, 20);
+      try { window.localStorage.setItem(HISTORY_KEY, JSON.stringify(next)); } catch { /* storage full or blocked */ }
+      return next;
+    });
+  }, []);
+
+  const restoreFromHistory = useCallback((entry: HistoryEntry) => {
+    setCode(entry.code);
+    setLanguage(entry.language);
+    setDevice(entry.device);
+  }, []);
+
+  const loadStarter = useCallback((nextCode: string, nextLanguage: Language, nextDevice: Device) => {
+    setCode(nextCode);
+    setLanguage(nextLanguage);
+    setDevice(nextDevice);
+  }, []);
+
+  const shareResult = useCallback(async () => {
+    if (result === null || result.short_id === null) return;
+    const url = `${window.location.origin}/s/${result.short_id}`;
+    try {
+      await navigator.clipboard.writeText(url);
+      setShareNotice('Share link copied to the clipboard.');
+    } catch {
+      setShareNotice(url);
+    }
+  }, [result]);
+
   useEffect(() => {
     const node = consoleRef.current;
     if (node) node.scrollTop = node.scrollHeight;
@@ -72,9 +155,10 @@ export default function Playground() {
     device,
     warmup,
     repetitions,
+    workload_mode: 'protocol',
     workload: { flops: workload.flops, bytes_transferred: workload.bytes },
     hardware,
-    challenge_id: null,
+    challenge_slug: null,
   }), [code, language, device, warmup, repetitions, workload, hardware]);
 
   const validation = useMemo(() => validateRequest(request), [request]);
@@ -101,10 +185,20 @@ export default function Playground() {
       setProgress(previous => ({ ...previous, [event.payload.stage]: event.payload.progress }));
     } else if (event.type === 'result') {
       setResult(event.payload);
+      appendHistory({
+        savedAt: new Date().toISOString(),
+        language,
+        device,
+        hardwareName: event.payload.hardware.name,
+        latency_ms: event.payload.latency_ms,
+        arithmetic_intensity: event.payload.arithmetic_intensity,
+        bottleneck: event.payload.bottleneck,
+        code,
+      });
     } else if (event.type === 'error') {
       setErrorMessage(event.payload.message);
     }
-  }, []);
+  }, [appendHistory, code, device, language]);
 
   const run = useCallback(async () => {
     if (!validation.ok) {
@@ -154,6 +248,14 @@ export default function Playground() {
         </div>
         <div className="flex flex-wrap items-center gap-2">
           <Badge tone="simulation">transport: local simulation - code is never executed</Badge>
+          <Badge tone={capabilities === null ? 'neutral' : 'measured'}>
+            {capabilities === null
+              ? 'backend: not reachable - local simulation'
+              : `backend: ${capabilities.mode} - cuda ${capabilities.devices.cuda ? 'available' : 'unavailable'}`}
+          </Badge>
+          {capabilities !== null && !capabilities.devices.cuda ? (
+            <Badge tone="estimate">this host cannot execute CUDA/Triton (CPU-only)</Badge>
+          ) : null}
           <Badge tone="neutral" icon={<Gauge size={12} />}>{`status: ${status}`}</Badge>
           {busy ? (
             <button
@@ -280,6 +382,36 @@ export default function Playground() {
               )}
             </div>
           </Panel>
+
+          <ChallengePanel onLoadStarter={loadStarter} />
+
+          <Panel title={`Run history (last ${history.length})`} icon={<History size={14} />}>
+            {history.length === 0 ? (
+              <p className="text-[11px] text-slate-500">
+                No saved runs yet. Results are stored in this browser only (localStorage, last 20) and never leave the machine.
+              </p>
+            ) : (
+              <ul className="flex flex-col gap-2">
+                {history.map(entry => (
+                  <li
+                    key={`${entry.savedAt}-${entry.language}-${entry.latency_ms}`}
+                    className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-slate-800 bg-slate-950 px-3 py-2"
+                  >
+                    <span className="kf-mono text-[11px] text-slate-300">
+                      {`${new Date(entry.savedAt).toLocaleTimeString()} - ${entry.language}/${entry.device} - ${entry.latency_ms.toFixed(3)} ms - AI ${entry.arithmetic_intensity === null ? 'n/a' : entry.arithmetic_intensity.toFixed(3)} FLOP/byte - ${entry.bottleneck ?? 'n/a'}`}
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => restoreFromHistory(entry)}
+                      className="rounded border border-slate-600 px-2 py-1 text-[11px] text-slate-200 hover:border-slate-400"
+                    >
+                      Restore code
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </Panel>
         </div>
 
         <div className="flex min-h-0 flex-col gap-3">
@@ -290,6 +422,7 @@ export default function Playground() {
               device={device}
               bytesTransferred={workload.bytes}
               latencyMs={result === null ? null : result.latency_ms}
+              bottleneck={result === null ? null : result.bottleneck}
             />
           </Panel>
 
@@ -329,6 +462,16 @@ export default function Playground() {
                 }
                 hint="achieved / bound (model)"
               />
+              <MetricCard
+                label="Bottleneck"
+                value={result === null || result.bottleneck === null ? '-' : result.bottleneck === 'memory' ? 'memory roof' : 'compute roof'}
+                hint="AI vs ridge point (derived)"
+              />
+              <MetricCard
+                label="Workload source"
+                value={result === null ? '-' : result.workload_source === 'user_estimate' ? 'declared (estimate)' : result.workload_source}
+                hint={result !== null && result.ignored_metadata ? 'returned metadata was ignored' : 'protocol metadata'}
+              />
               <MetricCard label="PCIe transfer" value="not measured" hint="no link instrumentation yet" />
               <MetricCard label="Challenge pass" value="n/a" hint="no evaluator or baseline kernel yet" />
             </div>
@@ -340,6 +483,32 @@ export default function Playground() {
               <Badge tone="simulation">{`movement: ${result === null ? 'simulation' : result.provenance.movement}`}</Badge>
               <Badge tone="neutral">{`hardware: ${hardware.name}`}</Badge>
             </div>
+            {result !== null && result.correctness.checked ? (
+              <p className={`mt-3 rounded-lg border px-3 py-2 text-[11px] ${result.correctness.passed ? 'border-emerald-500/40 bg-emerald-500/10 text-emerald-200' : 'border-rose-500/40 bg-rose-500/10 text-rose-200'}`}>
+                {`Correctness vs baseline: ${result.correctness.passed ? 'passed' : 'failed'} (max abs error ${result.correctness.max_abs_error === null ? 'n/a' : result.correctness.max_abs_error.toExponential(3)}, atol ${result.correctness.atol}, rtol ${result.correctness.rtol})`}
+              </p>
+            ) : null}
+            {result !== null && result.baseline !== null ? (
+              <p className="mt-3 rounded-lg border border-sky-500/40 bg-sky-500/10 px-3 py-2 text-[11px] text-sky-200">
+                {`Baseline ${result.baseline.name}: ${result.baseline.latency_ms.toFixed(3)} ms median - speedup ${result.baseline.speedup.toFixed(2)}x`}
+              </p>
+            ) : null}
+            {result !== null && result.short_id !== null ? (
+              <div className="mt-3 flex flex-wrap items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => { void shareResult(); }}
+                  className="rounded-lg border border-slate-600 bg-slate-900 px-2 py-1 text-[11px] text-slate-200 hover:border-slate-400"
+                >
+                  Copy share link
+                </button>
+                {shareNotice !== null ? <span className="text-[11px] text-slate-400">{shareNotice}</span> : null}
+              </div>
+            ) : (
+              <p className="mt-3 text-[11px] text-slate-500">
+                Share links appear once a gateway persists the run and returns a short_id; local simulation runs stay in this browser only.
+              </p>
+            )}
             <p className="mt-3 text-[11px] leading-5 text-slate-400">
               Simulation model: latency = max(FLOPs / peak compute, bytes / peak bandwidth) divided by an assumed
               efficiency (0.62 on cuda, 0.38 on cpu) with deterministic +/-6% jitter seeded from the source text. Ridge
