@@ -1,0 +1,93 @@
+@import "tailwindcss";
+
+:root {
+  color-scheme: dark;
+  --kf-panel: #0b1120;
+  --kf-panel-edge: #1e293b;
+}
+
+html,
+body {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background-color: #050810;
+  color: #e2e8f0;
+  font-family: ui-sans-serif, system-ui, "Segoe UI", sans-serif;
+}
+
+.kf-mono {
+  font-family: ui-monospace, SFMono-Regular, "Cascadia Mono", Consolas, monospace;
+}
+
+/* Data-movement packets: purely decorative animation of the illustrated path.
+   Travel distance is expressed in SVG viewBox units so it scales with the SVG. */
+@keyframes kf-packet-travel {
+  from {
+    transform: translateX(0);
+    opacity: 0;
+  }
+  12% {
+    opacity: 1;
+  }
+  88% {
+    opacity: 1;
+  }
+  to {
+    transform: translateX(60px);
+    opacity: 0;
+  }
+}
+
+.kf-packet {
+  animation: kf-packet-travel 1.5s linear infinite;
+}
+
+.kf-packet-2 {
+  animation-delay: 0.5s;
+}
+
+.kf-packet-3 {
+  animation-delay: 1s;
+}
+
+.kf-packet-idle {
+  animation: none;
+  opacity: 0;
+}
+
+@keyframes kf-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.45;
+  }
+}
+
+.kf-pulse {
+  animation: kf-pulse 1.4s ease-in-out infinite;
+}
+
+@keyframes kf-dash {
+  to {
+    stroke-dashoffset: -24;
+  }
+}
+
+.kf-dash {
+  animation: kf-dash 1.2s linear infinite;
+}
+
+*::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+*::-webkit-scrollbar-thumb {
+  background-color: #1e293b;
+  border-radius: 9999px;
+}

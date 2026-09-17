@@ -1,0 +1,313 @@
+{
+  "generated_by": "tools/gen-vectors.mjs",
+  "formulas": {
+    "arithmetic_intensity": "flops / bytes",
+    "bandwidth_gbps": "bytes / (latency_ms / 1000) / 1e9",
+    "compute_tflops": "flops / (latency_ms / 1000) / 1e12",
+    "attainable_tflops": "min(peak_compute_tflops, peak_bandwidth_gbps * ai / 1000)",
+    "ridge_point_ai": "peak_compute_tflops * 1000 / peak_bandwidth_gbps",
+    "bottleneck": "ai < ridge_point_ai ? memory : compute"
+  },
+  "tolerance": {
+    "relative": 1e-12,
+    "absolute": 0
+  },
+  "cases": [
+    {
+      "name": "t4-vector-add-bandwidth-bound",
+      "note": "N=2^20 fp32 vector add on a T4: AI 0.083 FLOP/byte sits below the ridge point",
+      "request": {
+        "code": "def benchmark():\n    return {\"output\": 1.0, \"flops\": 1, \"bytes\": 1}\n",
+        "language": "python",
+        "device": "cpu",
+        "warmup": 3,
+        "repetitions": 10,
+        "workload_mode": "protocol",
+        "workload": {
+          "flops": 1048576,
+          "bytes_transferred": 12582912
+        },
+        "hardware": {
+          "name": "NVIDIA T4 (nominal)",
+          "peak_compute_tflops": 8.1,
+          "peak_bandwidth_gbps": 320
+        },
+        "challenge_slug": null
+      },
+      "samples_ms": [
+        0.0393,
+        0.041,
+        0.0401
+      ],
+      "expected": {
+        "latency_ms": 0.0401,
+        "memory_throughput_gbps": 313.7883291770574,
+        "compute_tflops": 0.02614902743142145,
+        "arithmetic_intensity": 0.08333333333333333,
+        "attainable_tflops": 0.026666666666666665,
+        "bottleneck": "memory",
+        "workload_source": "protocol",
+        "ignored_metadata": false
+      }
+    },
+    {
+      "name": "t4-matmul-compute-bound",
+      "note": "1024^3 matmul on a T4: AI ~171 FLOP/byte sits above the ridge point",
+      "request": {
+        "code": "def benchmark():\n    return {\"output\": 1.0, \"flops\": 1, \"bytes\": 1}\n",
+        "language": "pytorch",
+        "device": "cuda",
+        "warmup": 3,
+        "repetitions": 10,
+        "workload_mode": "protocol",
+        "workload": {
+          "flops": 2147483648,
+          "bytes_transferred": 12582912
+        },
+        "hardware": {
+          "name": "NVIDIA T4 (nominal)",
+          "peak_compute_tflops": 8.1,
+          "peak_bandwidth_gbps": 320
+        },
+        "challenge_slug": null
+      },
+      "samples_ms": [
+        1.05,
+        1.11,
+        1.08
+      ],
+      "expected": {
+        "latency_ms": 1.08,
+        "memory_throughput_gbps": 11.650844444444445,
+        "compute_tflops": 1.988410785185185,
+        "arithmetic_intensity": 170.66666666666666,
+        "attainable_tflops": 8.1,
+        "bottleneck": "compute",
+        "workload_source": "protocol",
+        "ignored_metadata": false
+      }
+    },
+    {
+      "name": "zero-bytes-yields-null",
+      "note": "Zero transferred bytes must produce null AI, null attainable TFLOP/s and null bottleneck",
+      "request": {
+        "code": "def benchmark():\n    return {\"output\": 1.0, \"flops\": 1, \"bytes\": 1}\n",
+        "language": "python",
+        "device": "cpu",
+        "warmup": 3,
+        "repetitions": 10,
+        "workload_mode": "protocol",
+        "workload": {
+          "flops": 1000,
+          "bytes_transferred": 0
+        },
+        "hardware": {
+          "name": "NVIDIA T4 (nominal)",
+          "peak_compute_tflops": 8.1,
+          "peak_bandwidth_gbps": 320
+        },
+        "challenge_slug": null
+      },
+      "samples_ms": [
+        1.2
+      ],
+      "expected": {
+        "latency_ms": 1.2,
+        "memory_throughput_gbps": 0,
+        "compute_tflops": 8.333333333333333e-7,
+        "arithmetic_intensity": null,
+        "attainable_tflops": null,
+        "bottleneck": null,
+        "workload_source": "protocol",
+        "ignored_metadata": false
+      }
+    },
+    {
+      "name": "declared-mode-is-user-estimate",
+      "note": "Uninstrumented code: the declared numbers are labelled user_estimate",
+      "request": {
+        "code": "def benchmark():\n    return {\"output\": 1.0, \"flops\": 1, \"bytes\": 1}\n",
+        "language": "python",
+        "device": "cpu",
+        "warmup": 3,
+        "repetitions": 5,
+        "workload_mode": "declared",
+        "workload": {
+          "flops": 1000,
+          "bytes_transferred": 8000
+        },
+        "hardware": {
+          "name": "NVIDIA T4 (nominal)",
+          "peak_compute_tflops": 8.1,
+          "peak_bandwidth_gbps": 320
+        },
+        "challenge_slug": null
+      },
+      "samples_ms": [
+        2,
+        1.9,
+        2.2,
+        2.1,
+        1.8
+      ],
+      "expected": {
+        "latency_ms": 2,
+        "memory_throughput_gbps": 0.004,
+        "compute_tflops": 5e-7,
+        "arithmetic_intensity": 0.125,
+        "attainable_tflops": 0.04,
+        "bottleneck": "memory",
+        "workload_source": "user_estimate",
+        "ignored_metadata": false
+      }
+    },
+    {
+      "name": "challenge-theory-ignores-returned-metadata",
+      "note": "Challenge runs compute FLOPs/bytes server side, so returned metadata is flagged as ignored",
+      "request": {
+        "code": "def benchmark():\n    return {\"output\": 1.0, \"flops\": 1, \"bytes\": 1}\n",
+        "language": "python",
+        "device": "cpu",
+        "warmup": 3,
+        "repetitions": 10,
+        "workload_mode": "challenge_theory",
+        "workload": {
+          "flops": 1000,
+          "bytes_transferred": 8000
+        },
+        "hardware": {
+          "name": "NVIDIA T4 (nominal)",
+          "peak_compute_tflops": 8.1,
+          "peak_bandwidth_gbps": 320
+        },
+        "challenge_slug": "vector-add-1m"
+      },
+      "samples_ms": [
+        0.42,
+        0.44,
+        0.43
+      ],
+      "expected": {
+        "latency_ms": 0.43,
+        "memory_throughput_gbps": 0.018604651162790697,
+        "compute_tflops": 0.000002325581395348837,
+        "arithmetic_intensity": 0.125,
+        "attainable_tflops": 0.04,
+        "bottleneck": "memory",
+        "workload_source": "challenge_theory",
+        "ignored_metadata": true
+      }
+    },
+    {
+      "name": "cpu-socket-ridge-and-bottleneck",
+      "note": "CPU socket class has a ridge point of 13.3 FLOP/byte, so the same AI is still memory bound",
+      "request": {
+        "code": "def benchmark():\n    return {\"output\": 1.0, \"flops\": 1, \"bytes\": 1}\n",
+        "language": "python",
+        "device": "cpu",
+        "warmup": 3,
+        "repetitions": 10,
+        "workload_mode": "protocol",
+        "workload": {
+          "flops": 1048576,
+          "bytes_transferred": 12582912
+        },
+        "hardware": {
+          "name": "CPU socket class (nominal)",
+          "peak_compute_tflops": 0.8,
+          "peak_bandwidth_gbps": 60
+        },
+        "challenge_slug": null
+      },
+      "samples_ms": [
+        3.1,
+        3,
+        3.2,
+        2.9
+      ],
+      "expected": {
+        "latency_ms": 3.05,
+        "memory_throughput_gbps": 4.125544918032787,
+        "compute_tflops": 0.00034379540983606557,
+        "arithmetic_intensity": 0.08333333333333333,
+        "attainable_tflops": 0.005,
+        "bottleneck": "memory",
+        "workload_source": "protocol",
+        "ignored_metadata": false
+      }
+    },
+    {
+      "name": "even-sample-count-uses-midpoint",
+      "note": "Even repetition counts average the two central samples",
+      "request": {
+        "code": "def benchmark():\n    return {\"output\": 1.0, \"flops\": 1, \"bytes\": 1}\n",
+        "language": "python",
+        "device": "cpu",
+        "warmup": 3,
+        "repetitions": 4,
+        "workload_mode": "protocol",
+        "workload": {
+          "flops": 1000,
+          "bytes_transferred": 8000
+        },
+        "hardware": {
+          "name": "NVIDIA T4 (nominal)",
+          "peak_compute_tflops": 8.1,
+          "peak_bandwidth_gbps": 320
+        },
+        "challenge_slug": null
+      },
+      "samples_ms": [
+        4,
+        1,
+        2,
+        3
+      ],
+      "expected": {
+        "latency_ms": 2.5,
+        "memory_throughput_gbps": 0.0032,
+        "compute_tflops": 4e-7,
+        "arithmetic_intensity": 0.125,
+        "attainable_tflops": 0.04,
+        "bottleneck": "memory",
+        "workload_source": "protocol",
+        "ignored_metadata": false
+      }
+    },
+    {
+      "name": "high-bandwidth-triton-vector-add",
+      "note": "N=2^22 fp32 add: 48 MiB in 0.05 ms is ~1007 GB/s, at the T4 memory roof",
+      "request": {
+        "code": "def benchmark():\n    return {\"output\": 1.0, \"flops\": 1, \"bytes\": 1}\n",
+        "language": "triton",
+        "device": "cuda",
+        "warmup": 3,
+        "repetitions": 10,
+        "workload_mode": "protocol",
+        "workload": {
+          "flops": 4194304,
+          "bytes_transferred": 50331648
+        },
+        "hardware": {
+          "name": "NVIDIA T4 (nominal)",
+          "peak_compute_tflops": 8.1,
+          "peak_bandwidth_gbps": 320
+        },
+        "challenge_slug": null
+      },
+      "samples_ms": [
+        0.05
+      ],
+      "expected": {
+        "latency_ms": 0.05,
+        "memory_throughput_gbps": 1006.63296,
+        "compute_tflops": 0.08388608,
+        "arithmetic_intensity": 0.08333333333333333,
+        "attainable_tflops": 0.026666666666666665,
+        "bottleneck": "memory",
+        "workload_source": "protocol",
+        "ignored_metadata": false
+      }
+    }
+  ]
+}
