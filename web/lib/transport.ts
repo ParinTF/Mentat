@@ -14,7 +14,7 @@
  * by `node --test` after type stripping.
  */
 
-import type { BenchmarkRequest, BenchmarkResult, Bottleneck, Stage, TimingProvenance } from './roofline';
+import type { BenchmarkRequest, BenchmarkResult, Bottleneck, Stage, TimingProvenance, WorkloadMode } from './roofline';
 
 export type SubmissionStatus =
   | 'queued' | 'compiling' | 'running' | 'completed' | 'failed' | 'timed_out';
@@ -29,7 +29,7 @@ export interface TracePayload {
   bottleneck?: Bottleneck;
 }
 export interface ErrorPayload {
-  code: 'execution_error' | 'timeout' | 'infrastructure_error';
+  code: 'execution_error' | 'timeout' | 'infrastructure_error' | 'missing_workload_metadata';
   message: string;
 }
 
@@ -81,6 +81,10 @@ export interface SubmissionHandle {
 export interface KernelTransport {
   readonly mode: 'simulation' | 'sandbox';
   start(request: BenchmarkRequest, onEvent: (event: KernelEvent) => void): Promise<SubmissionHandle>;
+}
+
+export function workloadModeForExecution(mode: 'simulation' | 'sandbox'): WorkloadMode {
+  return mode === 'sandbox' ? 'protocol' : 'declared';
 }
 
 /** Deterministic PRNG so identical submissions simulate identically. */

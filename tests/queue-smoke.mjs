@@ -58,7 +58,7 @@ if (!isMainThread) {
     server.listen(0, '127.0.0.1');
     await once(server, 'listening');
     const url = `http://127.0.0.1:${server.address().port}/smoke/submissions`;
-    const payload = { code: 'def benchmark(): return 1', language: 'python', device: 'cpu', warmup: 0, repetitions: 1, workload: { flops: 1000, bytes_transferred: 8000 }, hardware: { name: 'Example', peak_compute_tflops: 10, peak_bandwidth_gbps: 500 } };
+    const payload = { code: 'def benchmark(): return 1', language: 'python', device: 'cpu', warmup: 0, repetitions: 1, workload_mode: 'declared', workload: { flops: 1000, bytes_transferred: 8000 }, hardware: { name: 'Example', peak_compute_tflops: 10, peak_bandwidth_gbps: 500 }, challenge_slug: null };
     const response = await fetch(url, { method: 'POST', body: JSON.stringify(payload), signal: AbortSignal.timeout(5000) });
     assert.equal(response.status, 202);
     const { submission_id } = await response.json();

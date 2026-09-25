@@ -3,6 +3,8 @@ node_modules/
 out/
 dist/
 __pycache__/
+.pytest_cache/
+.venv/
 *.log
 *.err
 *.tsbuildinfo

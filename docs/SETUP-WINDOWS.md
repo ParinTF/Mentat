@@ -155,6 +155,8 @@ winget install --id Python.Python.3.12 -e
 # แล้วปิด Store alias: Settings > Apps > Advanced app settings > App execution aliases
 # ปิด "python.exe" และ "python3.exe" ไม่ให้ชี้ไปที่ Microsoft Store
 python --version   # ต้องได้ Python 3.12.x
+```
+
 ## 4. ตรวจหลังติดตั้ง (checklist)
 
 | # | คำสั่ง | ผลที่ต้องได้ |
@@ -193,15 +195,16 @@ python --version   # ต้องได้ Python 3.12.x
 | `winget install Python.Python.3.12` | ได้ | ต้องปิด Store alias ผ่าน GUI |
 | ติดตั้ง NVIDIA driver | ทำไม่ได้ (ไม่มี GPU) | — |
 
-## 7. คำถามที่ยังค้างและคำตอบที่มีผลต่อขั้นถัดไป
+## 7. ขอบเขตที่ยืนยันแล้ว
 
-1. **จะให้ผมรัน `wsl --install -d Ubuntu` ให้เลยไหม** (เครื่องจะ reboot 1 ครั้ง)
-   หลัง reboot ผมติดตั้ง Docker Engine + `.wslconfig` + ตรวจซ้ำได้ทั้งหมด
-2. **ยอมรับ CPU-only สำหรับการพัฒนา/เดโมไหม** แล้วยก CUDA/Triton ไปทำบน cloud GPU ทีหลัง
-   (contract รองรับอยู่แล้ว) — หรือต้องการให้ผมออกแบบ queue แยกสำหรับ GPU host ตั้งแต่ตอนนี้
-3. **ขอบเขตของ "measured" บน CPU**: จะนับว่า `timing: measured` ได้เมื่อรันใน container จริง
-   แม้ FLOPs/bytes ยังเป็นค่าที่ผู้ใช้ประกาศ (ผสม `measured` + `user_estimate`) — ยืนยันไหม
-```
+รอบ implementation ปัจจุบันใช้ **CPU MVP** เท่านั้น: FastAPI, Celery, Redis, PostgreSQL และ
+Docker runner พร้อม Python/PyTorch CPU; CUDA/Triton รองรับเชิงสัญญาแต่ยังไม่มี worker
+บนเครื่องนี้ และไม่ได้สั่งติดตั้ง WSL2 เพราะต้องรีสตาร์ทเครื่อง เมื่อพร้อมให้ทำตามขั้นตอน
+ในคู่มือนี้แล้วรัน `docker compose up --build`.
+
+ค่า `provenance.timing = measured` หมายถึงเวลาที่วัดใน container จริง ส่วน
+`provenance.workload` จะเป็น `user_estimate` สำหรับ `declared` และ `protocol` เมื่อ metadata
+มาจาก `benchmark()`; โหมด local simulation จะรายงาน `user_estimate` เสมอ
 
 **ห้าม** ติดตั้ง `torch`/`triton` บน Windows host สำหรับโปรเจกต์นี้ — โค้ดของผู้ใช้ต้องรันใน
 container ที่ถูกจำกัดสิทธิ์เท่านั้น (ดู `contracts/API.md`)

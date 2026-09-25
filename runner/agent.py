@@ -1,19 +1,3 @@
-"""KernelForge in-container profiling agent.
-
-Trusted harness, baked into the runner image. It imports the submitted module
-in the SAME untrusted process (isolation comes from the container: no network,
-read-only rootfs, dropped capabilities, CPU/memory/PID limits), runs setup once,
-discards warmups, times each repetition, reduces the returned output and prints
-exactly one result line:
-
-    __KF_RESULT__ {"ok": true, ...}
-
-Everything else on stdout/stderr is treated as untrusted log text by the worker.
-A malicious submission CAN forge the sentinel line; the worker validates the
-shape and size of the payload but treats it as informational, never as
-attestation of what actually ran.
-"""
-
 from __future__ import annotations
 
 import argparse
@@ -29,14 +13,19 @@ from typing import Any, Callable
 SENTINEL = "__KF_RESULT__"
 DEFAULT_ITEMSIZE = 4
 SAMPLE_LIMIT = 64
+MAX_SAFE_INTEGER = 9_007_199_254_740_991
 
 
 class AgentError(RuntimeError):
-    """Raised for protocol problems the worker must see as a failure."""
+    pass
+
+
+class MetadataError(AgentError):
+    pass
 
 
 def emit(payload: dict[str, Any]) -> None:
-    sys.stdout.write(f"{SENTINEL} {json.dumps(payload, separators=(',', ':'))}\n")
+    sys.stdout.write(f"{SENTINEL} {json.dumps(payload, separators=(',', ':'), allow_nan=False)}\n")
     sys.stdout.flush()
 
 
@@ -57,36 +46,30 @@ def load_module(path: str, name: str):
     return module
 
 
-def extract_metadata(returned: Any, request: dict[str, Any]) -> tuple[int, int, bool]:
-    """FLOPs and bytes for this run.
+def _metadata_count(value: Any, key: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= MAX_SAFE_INTEGER:
+        raise MetadataError(f"protocol metadata {key} must be a non-negative safe integer")
+    return value
 
-    protocol: taken from the mapping benchmark() returned.
-    declared: taken from request.workload (reported as user_estimate).
-    challenge_theory: computed by the worker; metadata returned here is ignored.
-    Returns (flops, bytes, metadata_ignored).
-    """
-    mode = request.get("workload_mode", "declared")
+
+def extract_metadata(returned: Any, request: dict[str, Any]) -> tuple[int, int, bool]:
+    if not isinstance(returned, dict) or "output" not in returned:
+        raise AgentError("benchmark() must return a mapping containing output")
+    mode = request.get("workload_mode", "protocol")
     if mode == "declared":
         workload = request["workload"]
-        return int(workload["flops"]), int(workload["bytes_transferred"]), False
+        return _metadata_count(workload["flops"], "flops"), _metadata_count(workload["bytes_transferred"], "bytes"), False
     if mode == "challenge_theory":
         return 0, 0, True
-    if not isinstance(returned, dict):
-        raise AgentError("protocol mode requires benchmark() to return a mapping")
     for key in ("flops", "bytes"):
         if key not in returned:
-            raise AgentError(f"protocol mode requires benchmark() to return {key!r}")
-    flops, byte_count = returned["flops"], returned["bytes"]
-    for value in (flops, byte_count):
-        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-            raise AgentError("protocol metadata flops/bytes must be non-negative integers")
-    return int(flops), int(byte_count), False
+            raise MetadataError(f"protocol mode requires benchmark() to return {key!r}")
+    return _metadata_count(returned["flops"], "flops"), _metadata_count(returned["bytes"], "bytes"), False
 
 
-def timed_repetitions(benchmark: Callable[[], Any], warmup: int, repetitions: int, use_cuda: bool) -> list[float]:
-    """Warmups are discarded; each repetition is one synchronized sample."""
-    for _ in range(warmup):
-        benchmark()
+def timed_repetitions(benchmark: Callable[[], Any], repetitions: int, use_cuda: bool) -> list[float]:
+    if not 1 <= repetitions <= 100:
+        raise AgentError("repetitions must be within 1..100")
     samples: list[float] = []
     if use_cuda:
         import torch
@@ -99,17 +82,16 @@ def timed_repetitions(benchmark: Callable[[], Any], warmup: int, repetitions: in
             benchmark()
             end.record()
             torch.cuda.synchronize()
-            samples.append(float(start.elapsed_time(end)))
+            samples.append(max(float(start.elapsed_time(end)), 1e-9))
         return samples
     for _ in range(repetitions):
         started = time.perf_counter()
         benchmark()
-        samples.append((time.perf_counter() - started) * 1000.0)
+        samples.append(max((time.perf_counter() - started) * 1000.0, 1e-9))
     return samples
 
 
 def run_role(request: dict[str, Any], role: str, module_path: str) -> dict[str, Any]:
-    """Import one module, run setup/warmup/timed repetitions, return JSON."""
     module = load_module(module_path, f"kernelforge_{role}")
     setup = getattr(module, "setup", None)
     if callable(setup):
@@ -122,15 +104,27 @@ def run_role(request: dict[str, Any], role: str, module_path: str) -> dict[str, 
     if device == "cuda":
         try:
             import torch
-
-            use_cuda = bool(torch.cuda.is_available())
-        except Exception:
-            use_cuda = False
+        except Exception as error:
+            raise AgentError("CUDA runtime is unavailable") from error
+        if not torch.cuda.is_available():
+            raise AgentError("CUDA runtime is unavailable")
+        use_cuda = True
     warmup = int(request.get("warmup", 3))
     repetitions = int(request.get("repetitions", 10))
+    if not 0 <= warmup <= 10:
+        raise AgentError("warmup must be within 0..10")
+    if use_cuda:
+        import torch
+
+        for _ in range(warmup):
+            benchmark()
+            torch.cuda.synchronize()
+    else:
+        for _ in range(warmup):
+            benchmark()
     returned = benchmark()
     flops, byte_count, metadata_ignored = extract_metadata(returned, request)
-    samples = timed_repetitions(benchmark, warmup, repetitions, use_cuda)
+    samples = timed_repetitions(benchmark, repetitions, use_cuda)
     return {
         "role": role,
         "samples_ms": samples,
@@ -146,7 +140,10 @@ def run_role(request: dict[str, Any], role: str, module_path: str) -> dict[str, 
 
 
 def install_alarm(seconds: int) -> None:
-    def _handler(signum: int, frame: Any) -> None:  # noqa: ARG001 - signal API
+    if not hasattr(signal, "SIGALRM"):
+        return
+
+    def _handler(signum: int, frame: Any) -> None:
         raise TimeoutError("agent wall clock exceeded")
 
     signal.signal(signal.SIGALRM, _handler)
@@ -155,11 +152,11 @@ def install_alarm(seconds: int) -> None:
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="KernelForge in-container agent")
-    parser.add_argument("--request", required=True, help="path to request.json")
+    parser.add_argument("--request", required=True)
     parser.add_argument("--role", required=True, choices=["baseline", "submission"])
-    parser.add_argument("--module", required=True, help="path to the python module to measure")
-    parser.add_argument("--output", default="/output", help="directory for role result files")
-    parser.add_argument("--wall-clock", type=int, default=60, help="agent wall clock in seconds")
+    parser.add_argument("--module", required=True)
+    parser.add_argument("--output", default="/output")
+    parser.add_argument("--wall-clock", type=int, default=60)
     return parser.parse_args(argv)
 
 
@@ -173,21 +170,19 @@ def main(argv: list[str] | None = None) -> int:
         output_path = Path(args.output) / f"{args.role}.json"
         try:
             output_path.parent.mkdir(parents=True, exist_ok=True)
-            output_path.write_text(json.dumps(measurement, separators=(",", ":")), encoding="utf-8")
+            output_path.write_text(json.dumps(measurement, separators=(",", ":"), allow_nan=False), encoding="utf-8")
         except OSError:
-            pass  # /output may be read-only; stdout remains the source of truth
+            pass
         emit(payload)
         return 0
-    except AgentError as error:
-        return fail("execution_error", str(error))
+    except MetadataError as error:
+        return fail("missing_workload_metadata", str(error))
     except TimeoutError:
         return fail("timeout", "agent wall clock exceeded")
-    except Exception as error:  # noqa: BLE001 - the worker needs a reason, not a crash
+    except AgentError as error:
+        return fail("execution_error", str(error))
+    except Exception as error:
         return fail("execution_error", f"{type(error).__name__}: {error}")
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
 
 
 def _tensor_shape(value: Any) -> list[int] | None:
@@ -205,12 +200,18 @@ def _tensor_dtype(value: Any) -> str | None:
     return None if dtype is None else str(dtype)
 
 
+def _finite_number(value: int | float) -> float:
+    number = float(value)
+    if not math.isfinite(number):
+        raise AgentError("benchmark output contains a non-finite number")
+    return number
+
+
 def _flatten_numbers(value: Any) -> list[float]:
-    """Best-effort numeric flattening; non-numeric leaves are skipped."""
     if isinstance(value, bool):
-        return [float(value)]
+        return [_finite_number(value)]
     if isinstance(value, (int, float)):
-        return [float(value)]
+        return [_finite_number(value)]
     if isinstance(value, (list, tuple)):
         flattened: list[float] = []
         for item in value:
@@ -223,11 +224,10 @@ def _flatten_numbers(value: Any) -> list[float]:
 
 
 def reduce_output(value: Any) -> dict[str, Any]:
-    """Reduce an arbitrary benchmark() output to a bounded, comparable form."""
     if isinstance(value, dict) and "output" in value:
         return reduce_output(value["output"])
     if isinstance(value, bool) or isinstance(value, (int, float)):
-        numeric = float(value)
+        numeric = _finite_number(value)
         return {"kind": "scalar", "value": numeric, "count": 1, "sum": numeric}
     numbers = _flatten_numbers(value)
     shape = _tensor_shape(value)
@@ -243,3 +243,7 @@ def reduce_output(value: Any) -> dict[str, Any]:
         "sample": numbers[:SAMPLE_LIMIT],
         "abs_max": max((abs(number) for number in numbers), default=0.0),
     }
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

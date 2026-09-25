@@ -25,6 +25,15 @@ test('valid submission and metric SI units match contract', () => {
   assert.equal(result.passed, null);
   assert.equal(result.short_id, null);
 });
+test('submission defaults match the locked protocol', () => {
+  const defaults = { ...request };
+  delete defaults.warmup;
+  delete defaults.repetitions;
+  delete defaults.workload_mode;
+  assert.equal(validateSubmission(defaults), true);
+  assert.equal(calculateMetrics(defaults, [1]).provenance.workload, 'protocol');
+});
+
 test('median, zero bytes and compute ceiling', () => {
   assert.equal(calculateMetrics(request, [4, 1, 2, 3]).latency_ms, 2.5);
   assert.equal(calculateMetrics({ ...request, workload: { flops: 1, bytes_transferred: 0 } }, [1]).arithmetic_intensity, null);

@@ -1,17 +1,12 @@
-"""Request/response schemas (Pydantic v2) mirroring contracts/API.md v2.
-
-Validation is pure: it never touches Postgres, Redis or Docker, and it returns
-plain error strings that the API layer turns into `{detail: ...}` bodies.
-"""
-
 from __future__ import annotations
 
+import math
 import re
-from typing import Any, Literal, Mapping
+from typing import Annotated, Any, Literal, Mapping
 
-from pydantic import BaseModel
+from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, StrictInt, StrictStr, ValidationError, field_validator, model_validator
 
-from .config import MAX_CODE_BYTES, MAX_PEAK, MAX_REPETITIONS, MAX_WARMUP
+from .config import MAX_CODE_BYTES, MAX_PEAK, MAX_REPETITIONS, MAX_SAFE_INTEGER, MAX_WARMUP
 
 CHALLENGE_SLUG = re.compile(r"^[a-z0-9-]{3,64}$")
 LANGUAGES = ("python", "pytorch", "triton")
@@ -19,32 +14,74 @@ DEVICES = ("cpu", "cuda")
 WORKLOAD_MODES = ("protocol", "declared", "challenge_theory")
 
 SubmissionStatus = Literal["queued", "compiling", "running", "completed", "failed", "timed_out"]
+Language = Literal["python", "pytorch", "triton"]
+Device = Literal["cpu", "cuda"]
+WorkloadMode = Literal["protocol", "declared", "challenge_theory"]
 
 
-class HardwareSpec(BaseModel):
-    name: str
-    peak_compute_tflops: float
-    peak_bandwidth_gbps: float
+def _finite_peak(value: Any) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError("must be a number")
+    number = float(value)
+    if not math.isfinite(number) or not 0 < number <= MAX_PEAK:
+        raise ValueError(f"must be finite, >0 and <= {MAX_PEAK}")
+    return number
 
 
-class WorkloadEstimate(BaseModel):
-    flops: int
-    bytes_transferred: int
+FinitePeak = Annotated[float, BeforeValidator(_finite_peak)]
 
 
-class SubmissionRequest(BaseModel):
-    code: str
-    language: str
-    device: str
-    warmup: int
-    repetitions: int
-    workload_mode: str
+class ContractModel(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+
+class HardwareSpec(ContractModel):
+    name: StrictStr = Field(min_length=1, max_length=120)
+    peak_compute_tflops: FinitePeak
+    peak_bandwidth_gbps: FinitePeak
+
+    @field_validator("name")
+    @classmethod
+    def name_must_not_be_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("must not be blank")
+        return value
+
+
+class WorkloadEstimate(ContractModel):
+    flops: StrictInt = Field(ge=0, le=MAX_SAFE_INTEGER)
+    bytes_transferred: StrictInt = Field(ge=0, le=MAX_SAFE_INTEGER)
+
+
+class SubmissionRequest(ContractModel):
+    code: StrictStr
+    language: Language
+    device: Device
+    warmup: StrictInt = Field(default=3, ge=0, le=MAX_WARMUP)
+    repetitions: StrictInt = Field(default=10, ge=1, le=MAX_REPETITIONS)
+    workload_mode: WorkloadMode = "protocol"
     workload: WorkloadEstimate
     hardware: HardwareSpec
-    challenge_slug: str | None = None
+    challenge_slug: StrictStr | None = Field(default=None, pattern=CHALLENGE_SLUG.pattern)
+
+    @field_validator("code")
+    @classmethod
+    def code_must_fit_utf8_limit(cls, value: str) -> str:
+        size = len(value.encode("utf-8"))
+        if not 1 <= size <= MAX_CODE_BYTES:
+            raise ValueError(f"must be 1..{MAX_CODE_BYTES} UTF-8 bytes")
+        return value
+
+    @model_validator(mode="after")
+    def validate_execution_combination(self) -> "SubmissionRequest":
+        if self.language == "triton" and self.device != "cuda":
+            raise ValueError("triton requires device=cuda")
+        if self.workload_mode == "challenge_theory" and self.challenge_slug is None:
+            raise ValueError("challenge_theory requires challenge_slug")
+        return self
 
 
-class Correctness(BaseModel):
+class Correctness(ContractModel):
     checked: bool = False
     passed: bool | None = None
     max_abs_error: float | None = None
@@ -52,27 +89,27 @@ class Correctness(BaseModel):
     rtol: float = 1e-3
 
 
-class BaselineComparison(BaseModel):
+class BaselineComparison(ContractModel):
     name: str
     latency_ms: float
     speedup: float
 
 
-class Provenance(BaseModel):
-    timing: str
-    workload: str
-    movement: str
+class Provenance(ContractModel):
+    timing: Literal["measured", "simulation"]
+    workload: Literal["protocol", "challenge_theory", "user_estimate"]
+    movement: Literal["derived", "illustrative", "simulation"]
 
 
-class BenchmarkResult(BaseModel):
+class BenchmarkResult(ContractModel):
     short_id: str | None = None
     latency_ms: float
     memory_throughput_gbps: float
     compute_tflops: float
     arithmetic_intensity: float | None
     attainable_tflops: float | None
-    bottleneck: str | None
-    workload_source: str
+    bottleneck: Literal["memory", "compute"] | None
+    workload_source: Literal["protocol", "challenge_theory", "user_estimate"]
     ignored_metadata: bool
     pcie_transfer_ms: float | None = None
     passed: bool | None = None
@@ -83,82 +120,56 @@ class BenchmarkResult(BaseModel):
     samples_ms: list[float]
 
 
-def _plain_object(value: Any) -> bool:
-    return isinstance(value, dict)
+class SubmissionAccepted(ContractModel):
+    submission_id: str
+    status: Literal["queued"]
+    websocket_url: str
+    mode: Literal["simulation", "sandbox"]
+
+
+class SubmissionSnapshotResponse(ContractModel):
+    submission_id: str
+    status: SubmissionStatus
+    mode: Literal["simulation", "sandbox"]
+    result: BenchmarkResult | None
+    error: str | None
+
+
+class ShareSnapshot(ContractModel):
+    short_id: str
+    submission_id: str
+    challenge_slug: str | None
+    language: Language
+    device: Device
+    created_at: str
+    result: BenchmarkResult | None
 
 
 def validate_request(value: Any) -> str | None:
-    """Return None when the payload satisfies the contract, else the reason."""
-    if not _plain_object(value):
-        return "Body must be a JSON object"
-    allowed = {
-        "code", "language", "device", "warmup", "repetitions",
-        "workload_mode", "workload", "hardware", "challenge_slug",
-    }
-    if not set(value.keys()).issubset(allowed):
-        return "Unknown field in request"
-    code = value.get("code")
-    if not isinstance(code, str):
-        return "code must be a string"
-    code_bytes = len(code.encode("utf-8"))
-    if not 1 <= code_bytes <= MAX_CODE_BYTES:
-        return f"code must be 1..{MAX_CODE_BYTES} UTF-8 bytes (got {code_bytes})"
-    if value.get("language") not in LANGUAGES:
-        return "language must be python, pytorch or triton"
-    if value.get("device") not in DEVICES:
-        return "device must be cpu or cuda"
-    if value["language"] == "triton" and value["device"] != "cuda":
-        return "triton requires device=cuda"
-    warmup = value.get("warmup")
-    if isinstance(warmup, bool) or not isinstance(warmup, int) or not 0 <= warmup <= MAX_WARMUP:
-        return f"warmup must be an integer in 0..{MAX_WARMUP}"
-    repetitions = value.get("repetitions")
-    if isinstance(repetitions, bool) or not isinstance(repetitions, int) or not 1 <= repetitions <= MAX_REPETITIONS:
-        return f"repetitions must be an integer in 1..{MAX_REPETITIONS}"
-    if value.get("workload_mode") not in WORKLOAD_MODES:
-        return "workload_mode must be protocol, declared or challenge_theory"
-    workload = value.get("workload")
-    if not _plain_object(workload) or set(workload.keys()) != {"flops", "bytes_transferred"}:
-        return "workload must contain exactly flops and bytes_transferred"
-    for key in ("flops", "bytes_transferred"):
-        count = workload[key]
-        if isinstance(count, bool) or not isinstance(count, int) or count < 0:
-            return f"workload.{key} must be a non-negative integer"
-    hardware = value.get("hardware")
-    if not _plain_object(hardware) or set(hardware.keys()) != {"name", "peak_compute_tflops", "peak_bandwidth_gbps"}:
-        return "hardware must contain exactly name, peak_compute_tflops, peak_bandwidth_gbps"
-    name = hardware.get("name")
-    if not isinstance(name, str) or not name.strip() or len(name) > 120:
-        return "hardware.name must be 1..120 characters"
-    for key in ("peak_compute_tflops", "peak_bandwidth_gbps"):
-        peak = hardware.get(key)
-        if isinstance(peak, bool) or not isinstance(peak, (int, float)) or not 0 < float(peak) <= MAX_PEAK:
-            return f"hardware.{key} must be a finite number >0 and <= {MAX_PEAK}"
-    slug = value.get("challenge_slug")
-    if slug is not None and (not isinstance(slug, str) or not CHALLENGE_SLUG.match(slug)):
-        return "challenge_slug must be null or match ^[a-z0-9-]{3,64}$"
-    if value["workload_mode"] == "challenge_theory" and slug is None:
-        return "workload_mode=challenge_theory requires challenge_slug"
+    try:
+        SubmissionRequest.model_validate(value)
+    except ValidationError as error:
+        return str(error)
     return None
 
 
-def normalise_request(payload: Mapping[str, Any]) -> dict[str, Any]:
-    """Return a plain dict with the exact request shape the runner expects."""
+def normalise_request(payload: Mapping[str, Any] | SubmissionRequest) -> dict[str, Any]:
+    value = payload.model_dump() if isinstance(payload, SubmissionRequest) else dict(payload)
     return {
-        "code": payload["code"],
-        "language": payload["language"],
-        "device": payload["device"],
-        "warmup": int(payload["warmup"]),
-        "repetitions": int(payload["repetitions"]),
-        "workload_mode": payload["workload_mode"],
+        "code": value["code"],
+        "language": value["language"],
+        "device": value["device"],
+        "warmup": int(value.get("warmup", 3)),
+        "repetitions": int(value.get("repetitions", 10)),
+        "workload_mode": value.get("workload_mode", "protocol"),
         "workload": {
-            "flops": int(payload["workload"]["flops"]),
-            "bytes_transferred": int(payload["workload"]["bytes_transferred"]),
+            "flops": int(value["workload"]["flops"]),
+            "bytes_transferred": int(value["workload"]["bytes_transferred"]),
         },
         "hardware": {
-            "name": payload["hardware"]["name"],
-            "peak_compute_tflops": float(payload["hardware"]["peak_compute_tflops"]),
-            "peak_bandwidth_gbps": float(payload["hardware"]["peak_bandwidth_gbps"]),
+            "name": value["hardware"]["name"],
+            "peak_compute_tflops": float(value["hardware"]["peak_compute_tflops"]),
+            "peak_bandwidth_gbps": float(value["hardware"]["peak_bandwidth_gbps"]),
         },
-        "challenge_slug": payload.get("challenge_slug"),
+        "challenge_slug": value.get("challenge_slug"),
     }

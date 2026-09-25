@@ -7,6 +7,8 @@ import type { ChallengeEntry } from '@/lib/catalog';
 
 interface ChallengePanelProps {
   onLoadStarter: (code: string, language: ChallengeEntry['language'], device: ChallengeEntry['device']) => void;
+  disabled?: boolean;
+  disabledReason?: string;
 }
 
 type Tab = 'challenges' | 'concepts';
@@ -17,7 +19,7 @@ const METRIC_LABEL: Record<ChallengeEntry['target_metric'], string> = {
   compute_efficiency: 'compute efficiency',
 };
 
-export default function ChallengePanel({ onLoadStarter }: ChallengePanelProps) {
+export default function ChallengePanel({ onLoadStarter, disabled = false, disabledReason }: ChallengePanelProps) {
   const [tab, setTab] = useState<Tab>('challenges');
 
   return (
@@ -53,9 +55,10 @@ export default function ChallengePanel({ onLoadStarter }: ChallengePanelProps) {
                 <button
                   type="button"
                   onClick={() => onLoadStarter(entry.starter_code, entry.language, entry.device)}
-                  className="mt-2 rounded-lg border border-sky-500/50 bg-sky-500/10 px-2 py-1 text-[11px] font-semibold text-sky-200 hover:bg-sky-500/20"
+                  disabled={disabled}
+                  className="mt-2 rounded-lg border border-sky-500/50 bg-sky-500/10 px-2 py-1 text-[11px] font-semibold text-sky-200 hover:bg-sky-500/20 disabled:cursor-not-allowed disabled:opacity-40"
                 >
-                  Load starter into editor
+                  {disabled ? disabledReason ?? 'Unavailable on this worker' : 'Load starter into editor'}
                 </button>
               </li>
             ))}

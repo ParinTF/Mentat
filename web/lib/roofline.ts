@@ -105,11 +105,11 @@ export function validateRequest(value: unknown): ValidationResult {
   const device = value.device;
   if (device !== 'cpu' && device !== 'cuda') return { ok: false, detail: 'device must be cpu or cuda' };
   if (language === 'triton' && device !== 'cuda') return { ok: false, detail: 'triton requires device=cuda' };
-  const warmup = value.warmup;
+  const warmup = value.warmup ?? 3;
   if (typeof warmup !== 'number' || !Number.isInteger(warmup) || warmup < 0 || warmup > MAX_WARMUP) {
     return { ok: false, detail: `warmup must be an integer in 0..${MAX_WARMUP}` };
   }
-  const repetitions = value.repetitions;
+  const repetitions = value.repetitions ?? 10;
   if (typeof repetitions !== 'number' || !Number.isInteger(repetitions) || repetitions < 1 || repetitions > MAX_REPETITIONS) {
     return { ok: false, detail: `repetitions must be an integer in 1..${MAX_REPETITIONS}` };
   }
@@ -140,11 +140,11 @@ export function validateRequest(value: unknown): ValidationResult {
       return { ok: false, detail: `hardware.${label} must be finite, >0 and <=${MAX_PEAK}` };
     }
   }
-  const workloadMode = value.workload_mode;
+  const workloadMode = value.workload_mode ?? 'protocol';
   if (workloadMode !== 'protocol' && workloadMode !== 'declared' && workloadMode !== 'challenge_theory') {
     return { ok: false, detail: 'workload_mode must be protocol, declared or challenge_theory' };
   }
-  const challengeSlug = value.challenge_slug;
+  const challengeSlug = value.challenge_slug ?? null;
   if (challengeSlug != null && (typeof challengeSlug !== 'string' || !CHALLENGE_SLUG.test(challengeSlug))) {
     return { ok: false, detail: 'challenge_slug must be null or match ^[a-z0-9-]{3,64}$' };
   }

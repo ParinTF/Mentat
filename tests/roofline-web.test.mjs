@@ -10,6 +10,7 @@ import {
   validateRequest,
 } from '../web/lib/roofline.ts';
 import { calculateMetrics, validateSubmission } from '../demo/metrics.mjs';
+import { sampleFor } from '../web/lib/samples.ts';
 
 const request = {
   code: 'def benchmark():\n    return {"output": 1.0, "flops": 1000, "bytes": 8000}\n',
@@ -22,6 +23,12 @@ const request = {
   hardware: { name: 'Example specification', peak_compute_tflops: 10, peak_bandwidth_gbps: 500 },
   challenge_slug: null,
 };
+
+test('CPU worker samples do not select CUDA accidentally', () => {
+  assert.equal(sampleFor('python').device, 'cpu');
+  assert.equal(sampleFor('pytorch').device, 'cpu');
+  assert.equal(sampleFor('triton').device, 'cuda');
+});
 
 test('web UI formulas match the Node reference implementation', () => {
   const fromWeb = evaluateResult(request, [1.2]);
@@ -40,8 +47,13 @@ test('web UI formulas match the Node reference implementation', () => {
 });
 
 test('web validation accepts and rejects exactly what the Node validator does', () => {
+  const defaults = { ...request };
+  delete defaults.warmup;
+  delete defaults.repetitions;
+  delete defaults.workload_mode;
   const fixtures = [
     request,
+    defaults,
     { ...request, language: 'cpp' },
     { ...request, language: 'triton', device: 'cpu' },
     { ...request, language: 'triton', device: 'cuda' },
@@ -62,6 +74,11 @@ test('web validation accepts and rejects exactly what the Node validator does', 
   for (const fixture of fixtures) {
     assert.equal(validateRequest(fixture).ok, validateSubmission(fixture), JSON.stringify(fixture).slice(0, 90));
   }
+  const normalized = validateRequest(defaults);
+  assert.equal(normalized.ok, true);
+  assert.equal(normalized.request.warmup, 3);
+  assert.equal(normalized.request.repetitions, 10);
+  assert.equal(normalized.request.workload_mode, 'protocol');
   const rejected = validateRequest({ ...request, language: 'triton', device: 'cpu' });
   assert.equal(rejected.ok, false);
   assert.match(rejected.detail, /cuda/);

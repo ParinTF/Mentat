@@ -1,27 +1,42 @@
-"""WebSocket event envelopes plus the Redis replay buffer.
-
-Envelope contract (contracts/API.md):
-    {"version": 1, "submission_id": ..., "sequence": n, "timestamp": ISO-8601,
-     "type": status|log|trace|result|error|heartbeat, "payload": {...}}
-
-Sequence numbers start at 1 and are strictly monotonic per submission; the
-heartbeat uses sequence 0 and is never stored, so a client reconnecting with
-`after=<last seen>` replays exactly the persisted events.
-"""
-
 from __future__ import annotations
 
 import json
+import uuid
 from datetime import datetime, timezone
 from typing import Any, Mapping
 
 REPLAY_CHANNEL_PREFIX = "kf:events:"
+REPLAY_SEQUENCE_PREFIX = "kf:sequence:"
+REPLAY_EVENT_KEY_PREFIX = "kf:event-keys:"
 REPLAY_LIST_KEY_PREFIX = "kf:replay:"
 REPLAY_MAX_EVENTS = 1000
 REPLAY_TTL_SECONDS = 3600
 MAX_LOG_CHARS = 4096
-
 STAGES = ("host_ram", "pcie", "vram", "sram", "cores")
+
+_APPEND_SCRIPT = """
+local existing = redis.call('HGET', KEYS[2], ARGV[1])
+if existing then
+  return existing
+end
+local sequence = redis.call('INCR', KEYS[1])
+local envelope = cjson.encode({
+  version = 1,
+  submission_id = ARGV[2],
+  sequence = sequence,
+  timestamp = ARGV[5],
+  type = ARGV[3],
+  payload = cjson.decode(ARGV[4])
+})
+redis.call('HSET', KEYS[2], ARGV[1], envelope)
+redis.call('RPUSH', KEYS[3], envelope)
+redis.call('LTRIM', KEYS[3], -__MAX_EVENTS__, -1)
+redis.call('EXPIRE', KEYS[1], __TTL_SECONDS__)
+redis.call('EXPIRE', KEYS[2], __TTL_SECONDS__)
+redis.call('EXPIRE', KEYS[3], __TTL_SECONDS__)
+redis.call('PUBLISH', ARGV[6], envelope)
+return envelope
+""".replace("__MAX_EVENTS__", str(REPLAY_MAX_EVENTS)).replace("__TTL_SECONDS__", str(REPLAY_TTL_SECONDS))
 
 
 def now_iso() -> str:
@@ -30,7 +45,7 @@ def now_iso() -> str:
 
 def build_envelope(submission_id: str, sequence: int, event_type: str, payload: Mapping[str, Any], timestamp: str | None = None) -> dict[str, Any]:
     if sequence < 0:
-        raise ValueError("sequence must be >= 0 (0 is reserved for heartbeats)")
+        raise ValueError("sequence must be >= 0")
     if event_type not in {"status", "log", "trace", "result", "error", "heartbeat"}:
         raise ValueError(f"unknown event type {event_type!r}")
     return {
@@ -73,41 +88,64 @@ def error_payload(code: str, message: str) -> dict[str, Any]:
 
 
 class EventPublisher:
-    """Publishes envelopes to a per-submission Redis channel and keeps a
-    bounded replay list. Redis is imported lazily so the module stays
-    import-safe on machines without it."""
-
-    def __init__(self, redis_url: str, submission_id: str) -> None:
+    def __init__(self, redis_url: str) -> None:
         self._redis_url = redis_url
-        self._submission_id = submission_id
-        self._sequence = 0
         self._client: Any = None
+        self._append_script: Any = None
 
     def _connection(self) -> Any:
         if self._client is None:
-            import redis  # imported lazily: tests may not have redis installed
+            import redis
 
             self._client = redis.Redis.from_url(self._redis_url, decode_responses=True)
+            self._append_script = self._client.register_script(_APPEND_SCRIPT)
         return self._client
 
-    def emit(self, event_type: str, payload: Mapping[str, Any], timestamp: str | None = None) -> dict[str, Any]:
-        self._sequence += 1
-        envelope = build_envelope(self._submission_id, self._sequence, event_type, payload, timestamp)
-        client = self._connection()
-        key = REPLAY_LIST_KEY_PREFIX + self._submission_id
-        client.rpush(key, json.dumps(envelope))
-        client.ltrim(key, -REPLAY_MAX_EVENTS, -1)
-        client.expire(key, REPLAY_TTL_SECONDS)
-        client.publish(REPLAY_CHANNEL_PREFIX + self._submission_id, json.dumps(envelope))
-        return envelope
+    def emit(
+        self,
+        submission_id: str,
+        event_type: str,
+        payload: Mapping[str, Any],
+        event_key: str | None = None,
+        timestamp: str | None = None,
+    ) -> dict[str, Any]:
+        self._connection()
+        key = event_key or uuid.uuid4().hex
+        raw = self._append_script(
+            keys=[
+                REPLAY_SEQUENCE_PREFIX + submission_id,
+                REPLAY_EVENT_KEY_PREFIX + submission_id,
+                REPLAY_LIST_KEY_PREFIX + submission_id,
+            ],
+            args=[
+                key,
+                submission_id,
+                event_type,
+                json.dumps(dict(payload), separators=(",", ":")),
+                timestamp or now_iso(),
+                REPLAY_CHANNEL_PREFIX + submission_id,
+            ],
+        )
+        decoded = json.loads(raw)
+        if not isinstance(decoded, dict):
+            raise RuntimeError("Redis returned an invalid event envelope")
+        return decoded
 
-    def heartbeat(self) -> dict[str, Any]:
-        return build_envelope(self._submission_id, 0, "heartbeat", {})
+    def heartbeat(self, submission_id: str) -> dict[str, Any]:
+        return build_envelope(submission_id, 0, "heartbeat", {})
 
-    def replay(self, after: int) -> list[dict[str, Any]]:
-        """Events with sequence > after, oldest first; empty when history
-        expired (clients must then fall back to the GET snapshot)."""
-        client = self._connection()
-        raw = client.lrange(REPLAY_LIST_KEY_PREFIX + self._submission_id, 0, -1)
+    def replay(self, submission_id: str, after: int) -> list[dict[str, Any]]:
+        raw = self._connection().lrange(REPLAY_LIST_KEY_PREFIX + submission_id, 0, -1)
         events = [json.loads(item) for item in raw]
-        return [event for event in events if event["sequence"] > after]
+        return [event for event in events if int(event.get("sequence", 0)) > after]
+
+    def subscribe(self, submission_id: str) -> Any:
+        pubsub = self._connection().pubsub(ignore_subscribe_messages=True)
+        pubsub.subscribe(REPLAY_CHANNEL_PREFIX + submission_id)
+        return pubsub
+
+    def close(self) -> None:
+        if self._client is not None:
+            self._client.close()
+            self._client = None
+            self._append_script = None

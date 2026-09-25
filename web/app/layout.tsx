@@ -5,7 +5,7 @@ import './globals.css';
 export const metadata: Metadata = {
   title: 'KernelForge Playground',
   description:
-    'Micro-benchmark playground with a memory-hierarchy visualizer and roofline analysis. Simulation mode does not execute submitted code.',
+    'Micro-benchmark playground with isolated CPU execution, memory-hierarchy visualization, and roofline analysis.',
 };
 
 export default function RootLayout({ children }: { children: ReactNode }) {

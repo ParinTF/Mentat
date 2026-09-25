@@ -21,8 +21,8 @@ Root shortcuts: `npm run dev`, `npm run build`, `npm start`, `npm run typecheck`
 | Monaco editor | Real (Python grammar; PyTorch and Triton reuse it) |
 | Data-movement visualizer | Real SVG animation, but the progress values are **synthetic** - no counters are read |
 | Roofline chart | Real Recharts log-log plot; the marker is a **model** operating point |
-| Execution | **Local simulation only.** The submitted code is never executed, no container, no GPU |
-| Hardware peaks | User-entered **specifications**, never auto-detected |
+| Execution | Local simulation by default; isolated measured Python/PyTorch CPU execution when `NEXT_PUBLIC_KF_API` points to a sandbox gateway |
+| Hardware peaks | User-entered **specifications**; the worker reports its own CPU/OS capability snapshot |
 | PCIe transfer time / challenge pass | Not implemented (`null` / `n/a`) |
 
 The simulated latency is
@@ -31,13 +31,20 @@ efficiency is 0.62 (cuda) or 0.38 (cpu) with deterministic +/-6% jitter seeded
 from the source text. Every payload is labelled `timing: simulation`,
 `workload: user_estimate`, `movement: simulation`.
 
-## Wiring a real backend
+## Backend execution
 
-`lib/transport.ts` exposes `KernelTransport`. Add a WebSocket implementation that
-connects to `/api/v1/submissions/{id}/events` and pass it to `Playground` in place
-of `LocalSimulationTransport`; the UI consumes the same event union, so no
-component changes are required. Until the gateway, worker and Docker sandbox from
-step 2 exist, results stay honest by staying simulated.
+Set `NEXT_PUBLIC_KF_API` to the gateway origin, without `/api/v1`:
+
+```bash
+NEXT_PUBLIC_KF_API=http://localhost:8000 npm run dev
+```
+
+`lib/api.ts` owns HTTP calls and runtime response validation. `lib/gateway-transport.ts`
+implements the same `KernelTransport` seam as `LocalSimulationTransport`: it submits work,
+connects to the event WebSocket, suppresses duplicate cursors, reconnects with `after`, and
+falls back to the submission snapshot when replay history is missing. The Playground uses
+the gateway only when the worker reports a sandbox capability for the selected language and
+device; otherwise it remains in honest local-simulation mode.
 
 ## Notes and limitations
 

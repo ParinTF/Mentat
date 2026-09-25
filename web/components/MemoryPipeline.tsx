@@ -1,6 +1,6 @@
 'use client';
 
-import type { Device, Stage } from '@/lib/roofline';
+import type { Device, Stage, TimingProvenance } from '@/lib/roofline';
 
 interface StageNode {
   stage: Stage;
@@ -30,6 +30,7 @@ interface MemoryPipelineProps {
   device: Device;
   bytesTransferred: number;
   latencyMs: number | null;
+  timing: TimingProvenance | null;
   bottleneck: 'memory' | 'compute' | null;
 }
 
@@ -50,6 +51,7 @@ export default function MemoryPipeline({
   device,
   bytesTransferred,
   latencyMs,
+  timing,
   bottleneck,
 }: MemoryPipelineProps) {
   const bindingRoof = bottleneck === null
@@ -142,7 +144,7 @@ export default function MemoryPipeline({
         </text>
         <text x={BOX_X0} y={214} fontSize={11} fill="#64748b">
           {`device=${device}  |  declared traffic=${formatBytes(bytesTransferred)}  |  ${
-            latencyMs === null ? 'latency: not measured yet' : `simulated median latency=${latencyMs.toFixed(3)} ms`
+            latencyMs === null ? 'latency: not available yet' : `${timing ?? 'pending'} median latency=${latencyMs.toFixed(3)} ms`
           }`}
         </text>
       </svg>

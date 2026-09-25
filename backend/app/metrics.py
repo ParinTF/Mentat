@@ -66,22 +66,26 @@ def workload_source_for(workload_mode: str) -> str:
     return "user_estimate"
 
 
-def build_result(request: Mapping[str, Any], samples_ms: list[float], timing: str = "simulation") -> dict[str, Any]:
-    """Assemble the v2 BenchmarkResult for a request and its timed samples.
-
-    `timing` is "measured" when the samples come from a container run and
-    "simulation" for the local model. Nothing here invents hardware counters.
-    """
+def build_result(
+    request: Mapping[str, Any],
+    samples_ms: list[float],
+    timing: str = "simulation",
+    workload: Mapping[str, Any] | None = None,
+    short_id: str | None = None,
+) -> dict[str, Any]:
     if not samples_ms or any(not math.isfinite(value) or value <= 0 for value in samples_ms):
         raise ValueError("samples must be finite and positive")
+    if timing not in {"measured", "simulation"}:
+        raise ValueError("timing must be measured or simulation")
     latency = median(samples_ms)
-    flops = int(request["workload"]["flops"])
-    bytes_transferred = int(request["workload"]["bytes_transferred"])
+    effective_workload = workload or request["workload"]
+    flops = int(effective_workload["flops"])
+    bytes_transferred = int(effective_workload["bytes_transferred"])
     hardware = request["hardware"]
     ai = arithmetic_intensity(flops, bytes_transferred)
     workload_source = workload_source_for(request["workload_mode"])
     result: dict[str, Any] = {
-        "short_id": None,
+        "short_id": short_id,
         "latency_ms": latency,
         "memory_throughput_gbps": memory_throughput_gbps(bytes_transferred, latency),
         "compute_tflops": compute_tflops(flops, latency),

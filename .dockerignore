@@ -1,0 +1,10 @@
+.git
+.gitignore
+**/.next
+**/node_modules
+**/__pycache__
+**/*.pyc
+**/*.log
+backend/app/repository.py
+.env
+.env.*

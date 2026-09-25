@@ -44,11 +44,11 @@ const MATMUL_TORCH = `import torch
 
 
 def setup():
-    """Runs once before warmup; CUDA tensors are created here."""
+    """Runs once before warmup; CPU tensors are created here."""
     global a, b
     torch.manual_seed(0)
-    a = torch.randn(1024, 1024, device="cuda")
-    b = torch.randn(1024, 1024, device="cuda")
+    a = torch.randn(1024, 1024, device="cpu")
+    b = torch.randn(1024, 1024, device="cpu")
 
 
 def benchmark():
@@ -106,11 +106,11 @@ export const SAMPLES: Sample[] = [
     id: 'matmul-pytorch',
     label: 'Matmul 1024^3 (PyTorch)',
     language: 'pytorch',
-    device: 'cuda',
+    device: 'cpu',
     workload_mode: 'protocol',
     code: MATMUL_TORCH,
     workload: { flops: 2_147_483_648, bytes_transferred: 12_582_912 },
-    note: '2*1024^3 FLOPs (2.1 GFLOP), 3 fp32 1024^2 tiles -> AI ~171 FLOP/byte (compute bound).',
+    note: '2*1024^3 FLOPs (2.1 GFLOP), 3 fp32 1024^2 tiles -> AI ~171 FLOP/byte (compute bound) on the CPU worker.',
   },
   {
     id: 'vector-add-triton',

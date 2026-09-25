@@ -16,9 +16,12 @@ import type {
   Stage,
 } from '@/lib/roofline';
 import { evaluateResult, formatNumber, formatSi, ridgePointAi, validateRequest } from '@/lib/roofline';
+import { ApiClient } from '@/lib/api';
+import type { ApiCapabilities } from '@/lib/api';
+import { GatewayTransport } from '@/lib/gateway-transport';
 import { HARDWARE_PRESETS, SAMPLES, sampleFor } from '@/lib/samples';
-import type { KernelEvent, SubmissionHandle, SubmissionStatus } from '@/lib/transport';
-import { LocalSimulationTransport, PIPELINE_STAGES } from '@/lib/transport';
+import type { KernelEvent, KernelTransport, SubmissionHandle, SubmissionStatus } from '@/lib/transport';
+import { LocalSimulationTransport, PIPELINE_STAGES, workloadModeForExecution } from '@/lib/transport';
 
 type Status = SubmissionStatus | 'idle';
 
@@ -39,6 +42,8 @@ function emptyProgress(): Record<Stage, number> {
     return accumulator;
   }, {} as Record<Stage, number>);
 }
+
+const API_BASE = (process.env.NEXT_PUBLIC_KF_API ?? '').trim();
 
 export default function Playground() {
   const initialSample = sampleFor('python');
@@ -62,12 +67,6 @@ export default function Playground() {
   const consoleRef = useRef<HTMLDivElement | null>(null);
   const busy = status === 'queued' || status === 'compiling' || status === 'running';
 
-  interface Capabilities {
-    mode: string;
-    devices: { cpu: boolean; cuda: boolean };
-    languages: Record<string, boolean>;
-  }
-
   interface HistoryEntry {
     savedAt: string;
     language: Language;
@@ -80,27 +79,56 @@ export default function Playground() {
   }
 
   const HISTORY_KEY = 'kernelforge.history.v1';
-  const [capabilities, setCapabilities] = useState<Capabilities | null>(null);
+  const [capabilities, setCapabilities] = useState<ApiCapabilities | null>(null);
+  const [runToken, setRunToken] = useState('');
   const [history, setHistory] = useState<HistoryEntry[]>([]);
   const [shareNotice, setShareNotice] = useState<string | null>(null);
+  const apiClient = useMemo(() => API_BASE === '' ? null : new ApiClient(API_BASE, fetch, runToken), [runToken]);
+  const sandboxReady = capabilities?.mode === 'sandbox'
+    && capabilities.devices[device]
+    && capabilities.languages[language];
 
   useEffect(() => {
+    if (capabilities?.mode !== 'sandbox' || capabilities.devices.cuda || language !== 'triton') return;
+    const sample = sampleFor('python');
+    setCode(sample.code);
+    setLanguage('python');
+    setDevice('cpu');
+    setWorkload({ flops: sample.workload.flops, bytes: sample.workload.bytes_transferred });
+  }, [capabilities, language]);
+
+  useEffect(() => {
+    if (apiClient === null) return;
     let cancelled = false;
-    const base = process.env.NEXT_PUBLIC_KF_API ?? '';
-    if (base === '') return;
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 4000);
-    fetch(`${base}/api/v1/capabilities`, { signal: controller.signal })
-      .then(response => (response.ok ? response.json() : Promise.reject(new Error(`HTTP ${response.status}`))))
-      .then(data => { if (!cancelled) setCapabilities(data as Capabilities); })
-      .catch(() => { /* no backend reachable: stay in local simulation */ })
-      .finally(() => clearTimeout(timer));
+    let controller: AbortController | null = null;
+    let retryTimer: ReturnType<typeof setTimeout> | null = null;
+    const load = async (): Promise<void> => {
+      const currentController = new AbortController();
+      controller = currentController;
+      const timeout = setTimeout(() => currentController.abort(), 4000);
+      try {
+        const value = await apiClient.getCapabilities(currentController.signal);
+        if (cancelled) return;
+        setCapabilities(value);
+        if (value.mode === 'sandbox' && !value.devices.cuda) {
+          setDevice('cpu');
+          setPresetId('cpu-socket');
+          setHardware(HARDWARE_PRESETS.find(item => item.id === 'cpu-socket')?.spec ?? HARDWARE_PRESETS[0].spec);
+        }
+        if (value.mode === 'sandbox' && !value.devices.cpu) retryTimer = setTimeout(() => { void load(); }, 2000);
+      } catch {
+        if (!cancelled) setCapabilities(null);
+      } finally {
+        clearTimeout(timeout);
+      }
+    };
+    void load();
     return () => {
       cancelled = true;
-      clearTimeout(timer);
-      controller.abort();
+      if (retryTimer !== null) clearTimeout(retryTimer);
+      controller?.abort();
     };
-  }, []);
+  }, [apiClient]);
 
   useEffect(() => {
     const raw = window.localStorage.getItem(HISTORY_KEY);
@@ -155,11 +183,11 @@ export default function Playground() {
     device,
     warmup,
     repetitions,
-    workload_mode: 'protocol',
+    workload_mode: workloadModeForExecution(sandboxReady ? 'sandbox' : 'simulation'),
     workload: { flops: workload.flops, bytes_transferred: workload.bytes },
     hardware,
     challenge_slug: null,
-  }), [code, language, device, warmup, repetitions, workload, hardware]);
+  }), [code, language, device, warmup, repetitions, workload, hardware, sandboxReady]);
 
   const validation = useMemo(() => validateRequest(request), [request]);
 
@@ -209,12 +237,21 @@ export default function Playground() {
     setLogs([]);
     setResult(null);
     setProgress(emptyProgress());
-    const transport = new LocalSimulationTransport({ evaluate: evaluateResult });
-    const handle = await transport.start(validation.request, onEvent);
-    handleRef.current = handle;
-    await handle.finished;
-    handleRef.current = null;
-  }, [onEvent, validation]);
+    let handle: SubmissionHandle | null = null;
+    try {
+      const transport: KernelTransport = sandboxReady && apiClient !== null
+        ? new GatewayTransport({ client: apiClient })
+        : new LocalSimulationTransport({ evaluate: evaluateResult });
+      handle = await transport.start(validation.request, onEvent);
+      handleRef.current = handle;
+      await handle.finished;
+    } catch (error) {
+      setStatus('failed');
+      setErrorMessage(error instanceof Error ? error.message : 'Submission failed');
+    } finally {
+      if (handleRef.current === handle) handleRef.current = null;
+    }
+  }, [apiClient, onEvent, sandboxReady, validation]);
 
   const cancel = useCallback(() => {
     handleRef.current?.cancel();
@@ -247,14 +284,26 @@ export default function Playground() {
           </span>
         </div>
         <div className="flex flex-wrap items-center gap-2">
-          <Badge tone="simulation">transport: local simulation - code is never executed</Badge>
+          <Badge tone={sandboxReady ? 'measured' : 'simulation'}>
+            {sandboxReady ? 'transport: sandbox - submitted code runs in Docker' : 'transport: local simulation - code is never executed'}
+          </Badge>
           <Badge tone={capabilities === null ? 'neutral' : 'measured'}>
             {capabilities === null
               ? 'backend: not reachable - local simulation'
               : `backend: ${capabilities.mode} - cuda ${capabilities.devices.cuda ? 'available' : 'unavailable'}`}
           </Badge>
-          {capabilities !== null && !capabilities.devices.cuda ? (
-            <Badge tone="estimate">this host cannot execute CUDA/Triton (CPU-only)</Badge>
+          {capabilities?.mode === 'sandbox' && !capabilities.devices.cuda ? (
+            <Badge tone="estimate">CPU-only worker - CUDA and Triton unavailable</Badge>
+          ) : null}
+          {API_BASE !== '' ? (
+            <input
+              type="password"
+              value={runToken}
+              onChange={event => setRunToken(event.target.value)}
+              placeholder="run token (public mode)"
+              aria-label="KernelForge run token"
+              className="w-36 rounded border border-slate-700 bg-slate-950 px-2 py-1 text-[11px] text-slate-200"
+            />
           ) : null}
           <Badge tone="neutral" icon={<Gauge size={12} />}>{`status: ${status}`}</Badge>
           {busy ? (
@@ -263,7 +312,7 @@ export default function Playground() {
               onClick={cancel}
               className="flex items-center gap-2 rounded-lg border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-xs font-semibold text-rose-300 hover:bg-rose-500/20"
             >
-              <Square size={14} /> Cancel
+              <Square size={14} /> {sandboxReady ? 'Detach' : 'Cancel'}
             </button>
           ) : (
             <button
@@ -272,7 +321,7 @@ export default function Playground() {
               disabled={!validation.ok}
               className="flex items-center gap-2 rounded-lg bg-sky-500 px-3 py-2 text-xs font-semibold text-slate-950 hover:bg-sky-400 disabled:cursor-not-allowed disabled:bg-slate-700 disabled:text-slate-400"
             >
-              <Play size={14} /> Run simulation (Ctrl+Enter)
+              <Play size={14} /> {sandboxReady ? 'Run benchmark' : 'Run simulation'} (Ctrl+Enter)
             </button>
           )}
         </div>
@@ -297,6 +346,7 @@ export default function Playground() {
             right={<LanguageControls
               language={language}
               device={device}
+              capabilities={capabilities}
               onLanguage={applySample}
               onDevice={setDevice}
             />}
@@ -370,7 +420,7 @@ export default function Playground() {
             <div ref={consoleRef} className="kf-mono h-40 overflow-y-auto rounded-lg bg-slate-950 p-2 text-[11px] leading-5">
               {logs.length === 0 ? (
                 <p className="text-slate-500">
-                  No events yet. Run a simulation to stream status, log, trace and result events.
+                  No events yet. Run a benchmark to stream status, log, trace and result events.
                 </p>
               ) : (
                 logs.map(line => (
@@ -383,12 +433,16 @@ export default function Playground() {
             </div>
           </Panel>
 
-          <ChallengePanel onLoadStarter={loadStarter} />
+          <ChallengePanel
+            onLoadStarter={loadStarter}
+            disabled={capabilities?.mode === 'sandbox'}
+            disabledReason="Challenge execution is not in the CPU MVP"
+          />
 
           <Panel title={`Run history (last ${history.length})`} icon={<History size={14} />}>
             {history.length === 0 ? (
               <p className="text-[11px] text-slate-500">
-                No saved runs yet. Results are stored in this browser only (localStorage, last 20) and never leave the machine.
+                No saved runs yet. Local history is stored in this browser only (localStorage, last 20); sandbox submissions are persisted by the gateway for results and sharing.
               </p>
             ) : (
               <ul className="flex flex-col gap-2">
@@ -422,6 +476,7 @@ export default function Playground() {
               device={device}
               bytesTransferred={workload.bytes}
               latencyMs={result === null ? null : result.latency_ms}
+              timing={result === null ? null : result.provenance.timing}
               bottleneck={result === null ? null : result.bottleneck}
             />
           </Panel>
@@ -431,7 +486,7 @@ export default function Playground() {
               <MetricCard
                 label="Median latency"
                 value={result === null ? '-' : formatNumber(result.latency_ms, 3, 'ms')}
-                hint="median of simulated samples"
+                hint={result?.provenance.timing === 'measured' ? 'median of synchronized samples' : 'median of simulated samples'}
               />
               <MetricCard
                 label="Memory bandwidth"
@@ -509,13 +564,20 @@ export default function Playground() {
                 Share links appear once a gateway persists the run and returns a short_id; local simulation runs stay in this browser only.
               </p>
             )}
-            <p className="mt-3 text-[11px] leading-5 text-slate-400">
-              Simulation model: latency = max(FLOPs / peak compute, bytes / peak bandwidth) divided by an assumed
-              efficiency (0.62 on cuda, 0.38 on cpu) with deterministic +/-6% jitter seeded from the source text. Ridge
-              point sits at AI = peak compute x 1000 / peak bandwidth = {formatSi(ridgePointAi(hardware))} FLOP/byte.
-              Nothing here is a hardware counter reading, and challenge pass cannot be decided from self-reported
-              numbers.
-            </p>
+            {sandboxReady ? (
+              <p className="mt-3 text-[11px] leading-5 text-slate-400">
+                Sandbox timing is measured by the isolated runner. FLOPs and bytes come from the benchmark protocol;
+                movement remains derived from the returned workload, and the ridge point is {formatSi(ridgePointAi(hardware))} FLOP/byte.
+              </p>
+            ) : (
+              <p className="mt-3 text-[11px] leading-5 text-slate-400">
+                Simulation model: latency = max(FLOPs / peak compute, bytes / peak bandwidth) divided by an assumed
+                efficiency (0.62 on cuda, 0.38 on cpu) with deterministic +/-6% jitter seeded from the source text. Ridge
+                point sits at AI = peak compute x 1000 / peak bandwidth = {formatSi(ridgePointAi(hardware))} FLOP/byte.
+                Nothing here is a hardware counter reading, and challenge pass cannot be decided from self-reported
+                numbers.
+              </p>
+            )}
           </Panel>
 
           <Panel
@@ -625,14 +687,17 @@ function NumberField({
 function LanguageControls({
   language,
   device,
+  capabilities,
   onLanguage,
   onDevice,
 }: {
   language: Language;
   device: Device;
+  capabilities: ApiCapabilities | null;
   onLanguage: (next: Language) => void;
   onDevice: (next: Device) => void;
 }) {
+  const sandbox = capabilities?.mode === 'sandbox';
   const selectClass = 'rounded border border-slate-700 bg-slate-950 px-2 py-1 text-xs text-slate-100 disabled:opacity-60';
   return (
     <span className="flex flex-wrap items-center gap-2 text-[11px] text-slate-400">
@@ -643,19 +708,24 @@ function LanguageControls({
         className={selectClass}
       >
         {SAMPLES.map(sample => (
-          <option key={sample.id} value={sample.language}>{sample.label}</option>
+          <option
+            key={sample.id}
+            value={sample.language}
+            disabled={sandbox && !capabilities.languages[sample.language]}
+          >
+            {sample.label}
+          </option>
         ))}
       </select>
       <select
         aria-label="Device"
         value={device}
         onChange={event => onDevice(event.target.value as Device)}
-        disabled={language === 'triton'}
         className={selectClass}
-        title={language === 'triton' ? 'Triton kernels require cuda' : 'Declared execution device'}
+        title={sandbox ? 'Devices reported by the isolated worker' : 'Declared execution device'}
       >
-        <option value="cpu">cpu</option>
-        <option value="cuda">cuda</option>
+        <option value="cpu" disabled={sandbox && !capabilities.devices.cpu}>cpu</option>
+        <option value="cuda" disabled={sandbox && !capabilities.devices.cuda}>cuda</option>
       </select>
     </span>
   );

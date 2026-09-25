@@ -1,41 +1,29 @@
-"""Host capability probing. Everything reported here is probed, never guessed:
-the API refuses CUDA/Triton work when the host cannot execute it."""
-
 from __future__ import annotations
 
-import importlib.util
+import json
+import os
+import platform
 import shutil
 import subprocess
-from functools import lru_cache
 from typing import Any
 
 from .config import MAX_CODE_BYTES, MAX_REPETITIONS, Settings, settings
+from .runners import container_flags
+
+PROBE_SCRIPT = "import importlib.util,json,os,platform;print(json.dumps({'os':platform.system(),'arch':platform.machine(),'cpu_cores':os.cpu_count() or 1,'memory_gb':round(os.sysconf('SC_PAGE_SIZE')*os.sysconf('SC_PHYS_PAGES')/1073741824,2),'pytorch':importlib.util.find_spec('torch') is not None}))"
 
 
-def _torch_cuda_available() -> bool:
-    try:
-        import torch  # type: ignore import-not-found
-    except Exception:  # torch is absent or broken: report honestly
-        return False
-    try:
-        return bool(torch.cuda.is_available())
-    except Exception:
-        return False
+def _docker_base(settings: Settings) -> list[str]:
+    command = ["docker"]
+    if settings.docker_host:
+        command += ["-H", settings.docker_host]
+    return command
 
 
-def _triton_available() -> bool:
-    try:
-        return importlib.util.find_spec("triton") is not None
-    except Exception:
-        return False
-
-
-def _docker_reachable(docker_host: str | None) -> bool:
+def _docker_reachable(settings: Settings) -> bool:
     if shutil.which("docker") is None:
         return False
-    command = ["docker", "info", "--format", "{{.ServerVersion}}"]
-    if docker_host:
-        command = ["docker", "-H", docker_host, "info", "--format", "{{.ServerVersion}}"]
+    command = _docker_base(settings) + ["info", "--format", "{{.ServerVersion}}"]
     try:
         completed = subprocess.run(command, capture_output=True, timeout=10, check=False)
     except (OSError, subprocess.TimeoutExpired):
@@ -43,41 +31,99 @@ def _docker_reachable(docker_host: str | None) -> bool:
     return completed.returncode == 0
 
 
-@lru_cache(maxsize=1)
-def probe(mode: str, docker_host: str | None, force_docker_probe: bool = True) -> dict[str, Any]:
-    """Probe the execution host once per process and cache the result."""
-    cuda = mode == "sandbox" and _torch_cuda_available() and _docker_reachable(docker_host)
+def _host() -> dict[str, Any]:
+    memory_gb = 0.0
+    if hasattr(os, "sysconf"):
+        try:
+            memory_gb = round(os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") / 1073741824, 2)
+        except (OSError, ValueError):
+            memory_gb = 0.0
     return {
-        "mode": mode,
-        "devices": {"cpu": mode == "sandbox" and _docker_reachable(docker_host), "cuda": cuda},
-        "languages": {
-            "python": mode == "sandbox",
-            "pytorch": mode == "sandbox",
-            "triton": mode == "sandbox" and cuda,
-        },
+        "os": platform.system(),
+        "arch": platform.machine(),
+        "cpu_cores": os.cpu_count() or 1,
+        "memory_gb": memory_gb,
+    }
+
+
+def unavailable_capabilities(current: Settings) -> dict[str, Any]:
+    simulation = current.mode == "simulation"
+    return {
+        "mode": current.mode,
+        "devices": {"cpu": simulation, "cuda": False},
+        "languages": {"python": simulation, "pytorch": simulation, "triton": False},
         "limits": {
             "max_code_bytes": MAX_CODE_BYTES,
             "max_repetitions": MAX_REPETITIONS,
-            "wall_time_s": Settings.from_env().max_container_seconds,
+            "wall_time_s": current.max_container_seconds,
+        },
+        "host": _host(),
+    }
+
+
+def probe_runner_image(mode: str, docker_host: str | None, image: str, max_seconds: int) -> dict[str, Any]:
+    current = Settings(
+        database_url="",
+        redis_url="",
+        run_token=None,
+        mode=mode,
+        concurrency=1,
+        max_container_seconds=max_seconds,
+        max_log_bytes=65_536,
+        runner_image_cpu=image,
+        runner_image_cuda="",
+        docker_host=docker_host,
+        runner_input_root="",
+        runner_input_volume="",
+        cors_origins=(),
+    )
+    unavailable = unavailable_capabilities(current)
+    if mode != "sandbox" or not _docker_reachable(current):
+        return unavailable
+    command = _docker_base(current) + container_flags(current)
+    command += [image, "python", "-c", PROBE_SCRIPT]
+    try:
+        completed = subprocess.run(
+            command,
+            capture_output=True,
+            timeout=max_seconds + 5,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return unavailable
+    if completed.returncode != 0:
+        return unavailable
+    try:
+        payload = json.loads((completed.stdout or b"")[-4096:].decode("utf-8", errors="replace").strip())
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return unavailable
+    pytorch = bool(payload.get("pytorch"))
+    return {
+        "mode": "sandbox",
+        "devices": {"cpu": True, "cuda": False},
+        "languages": {"python": True, "pytorch": pytorch, "triton": False},
+        "limits": {
+            "max_code_bytes": MAX_CODE_BYTES,
+            "max_repetitions": MAX_REPETITIONS,
+            "wall_time_s": max_seconds,
         },
         "host": {
-            "docker_reachable": _docker_reachable(docker_host),
-            "torch_installed": importlib.util.find_spec("torch") is not None,
-            "triton_installed": _triton_available(),
+            "os": str(payload.get("os", "")),
+            "arch": str(payload.get("arch", "")),
+            "cpu_cores": int(payload.get("cpu_cores", 1)),
+            "memory_gb": float(payload.get("memory_gb", 0)),
         },
     }
 
 
-def capabilities() -> dict[str, Any]:
-    current: Settings = settings()
-    return probe(current.mode, current.docker_host)
-
-
-def supports(device: str, language: str) -> tuple[bool, str | None]:
-    """(allowed, reason) for a requested device/language pair."""
-    caps = capabilities()
-    if not caps["devices"].get(device, False):
+def supports(capabilities: dict[str, Any], device: str, language: str) -> tuple[bool, str | None]:
+    if not capabilities.get("devices", {}).get(device, False):
         return False, "unsupported_device"
-    if not caps["languages"].get(language, False):
+    if not capabilities.get("languages", {}).get(language, False):
         return False, "unsupported_language"
     return True, None
+
+
+def current_capabilities() -> dict[str, Any]:
+    current = settings()
+    return probe_runner_image(current.mode, current.docker_host, current.runner_image_cpu, current.max_container_seconds)

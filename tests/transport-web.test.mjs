@@ -6,6 +6,7 @@ import {
   SIMULATED_EFFICIENCY,
   idealSeconds,
   simulateSamples,
+  workloadModeForExecution,
 } from '../web/lib/transport.ts';
 import { evaluateResult } from '../web/lib/roofline.ts';
 import { calculateMetrics } from '../demo/metrics.mjs';
@@ -24,6 +25,11 @@ const request = {
 
 const instantClock = { sleep: async () => {} };
 const fixedId = () => '8f14e45f-ea0a-4a2b-9c1d-5f6a7b8c9d0e';
+
+test('execution mode selects honest workload provenance', () => {
+  assert.equal(workloadModeForExecution('simulation'), 'declared');
+  assert.equal(workloadModeForExecution('sandbox'), 'protocol');
+});
 
 test('local simulation emits the contract envelope in order and never claims to measure', async () => {
   const transport = new LocalSimulationTransport({

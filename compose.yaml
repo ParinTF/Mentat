@@ -1,0 +1,126 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: kernelforge
+      POSTGRES_USER: kernelforge
+      POSTGRES_PASSWORD: kernelforge
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./db:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U kernelforge -d kernelforge"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  runner-cpu:
+    image: kernelforge-runner-cpu:latest
+    build:
+      context: .
+      dockerfile: runner/Dockerfile.cpu
+    command: ["python", "-c", "import torch; print(torch.__version__)"]
+    restart: "no"
+
+  api:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    environment:
+      KF_MODE: sandbox
+      KF_CONCURRENCY: "1"
+      KF_DATABASE_URL: postgresql://kernelforge:kernelforge@postgres:5432/kernelforge
+      KF_REDIS_URL: redis://redis:6379/0
+      KF_RUNNER_IMAGE_CPU: kernelforge-runner-cpu:latest
+      KF_CORS_ORIGINS: http://localhost:3000,http://127.0.0.1:3000
+      KF_RUN_TOKEN: ${KF_RUN_TOKEN:-}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:8000:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/v1/health')"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  worker:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    command: ["celery", "-A", "app.worker:celery_app", "worker", "--loglevel=INFO", "--concurrency=1"]
+    user: "${KF_DOCKER_GID:-0}:${KF_DOCKER_GID:-0}"
+    environment:
+      KF_MODE: sandbox
+      KF_CONCURRENCY: "1"
+      KF_DATABASE_URL: postgresql://kernelforge:kernelforge@postgres:5432/kernelforge
+      KF_REDIS_URL: redis://redis:6379/0
+      KF_DOCKER_HOST: unix:///var/run/docker.sock
+      KF_RUNNER_IMAGE_CPU: kernelforge-runner-cpu:latest
+      KF_RUNNER_INPUT_ROOT: /var/lib/kf/runs
+      KF_RUNNER_INPUT_VOLUME: kernelforge-runner-inputs
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      runner-cpu:
+        condition: service_completed_successfully
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - runner-inputs:/var/lib/kf/runs
+    restart: unless-stopped
+
+  beat:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    command: ["celery", "-A", "app.worker:celery_app", "beat", "--loglevel=INFO", "--schedule=/tmp/celerybeat-schedule"]
+    environment:
+      KF_MODE: sandbox
+      KF_REDIS_URL: redis://redis:6379/0
+      KF_DATABASE_URL: postgresql://kernelforge:kernelforge@postgres:5432/kernelforge
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  web:
+    build:
+      context: ./web
+      dockerfile: Dockerfile
+      args:
+        NEXT_PUBLIC_KF_API: ${NEXT_PUBLIC_KF_API:-http://localhost:8000}
+    environment:
+      NEXT_PUBLIC_KF_API: ${NEXT_PUBLIC_KF_API:-http://localhost:8000}
+      KF_INTERNAL_API: http://api:8000
+    depends_on:
+      api:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:3000:3000"
+    restart: unless-stopped
+
+volumes:
+  postgres-data:
+  redis-data:
+  runner-inputs:
+    name: kernelforge-runner-inputs
